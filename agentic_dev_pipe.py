@@ -421,6 +421,19 @@ def cmd_errors(n: int = 20) -> None:
 
 # ── Dispatch ─────────────────────────────────────────────────────────────────
 
+def cmd_graph() -> None:
+    """Print a Mermaid diagram of the LangGraph workflow to stdout."""
+    try:
+        from graph.workflow import visualize_workflow  # noqa: PLC0415
+        print(visualize_workflow())
+    except ImportError:
+        print("langgraph not installed — run: pip install langgraph langgraph-checkpoint-sqlite")
+        sys.exit(1)
+    except Exception as e:
+        print(f"error visualizing graph: {e}")
+        sys.exit(1)
+
+
 COMMANDS = {
     "start":   cmd_start,
     "stop":    cmd_stop,
@@ -430,11 +443,12 @@ COMMANDS = {
     "logs":    cmd_logs,
     "poller":  cmd_poller,
     "errors":  cmd_errors,
+    "graph":   cmd_graph,
 }
 
 
 def usage() -> None:
-    print("usage: agentic-dev-pipe {start|stop|restart|status|metrics|logs|poller|errors}")
+    print("usage: agentic-dev-pipe {start|stop|restart|status|metrics|logs|poller|errors|graph}")
 
 
 def main() -> None:
