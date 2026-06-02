@@ -9,12 +9,12 @@
 ## Step 1 — Stop the daemon
 
 ```bash
-pipe-stop
+agentic-dev-pipe stop
 ```
 
 Verify it's stopped:
 ```bash
-adp status   # should say "NOT RUNNING"
+agentic-dev-pipe status   # should say "NOT RUNNING"
 ```
 
 ---
@@ -112,8 +112,8 @@ Should print a Mermaid diagram. If it errors, check the error before proceeding.
 
 Also verify the CLI works:
 ```bash
-adp graph    # same diagram via CLI
-adp status   # should say NOT RUNNING (daemon still stopped)
+agentic-dev-pipe graph    # same diagram via CLI
+agentic-dev-pipe status   # should say NOT RUNNING (daemon still stopped)
 ```
 
 ---
@@ -121,12 +121,12 @@ adp status   # should say NOT RUNNING (daemon still stopped)
 ## Step 7 — Start the daemon
 
 ```bash
-pipe-start
+agentic-dev-pipe start
 ```
 
 Immediately tail the log to catch startup errors:
 ```bash
-pipe-poller-log
+agentic-dev-pipe poller
 ```
 
 Expected first lines:
@@ -148,9 +148,9 @@ Work through the verification table in order. Use a **test spike ticket** first 
 
 | Test | What to do | Expected result |
 |---|---|---|
-| Daemon starts | `pipe-start` + `pipe-poller-log` | "LangGraph workflow compiled and ready" in log |
-| Import check | `adp graph` | Mermaid diagram prints |
-| Status check | `adp status` | Shows daemon PID and poll time |
+| Daemon starts | `agentic-dev-pipe start` + `agentic-dev-pipe poller` | "LangGraph workflow compiled and ready" in log |
+| Import check | `agentic-dev-pipe graph` | Mermaid diagram prints |
+| Status check | `agentic-dev-pipe status` | Shows daemon PID and poll time |
 | Ticket pickup | Move any ticket to `Ready To Pick Up` | Ticket advances to `AI Planning` or `AI Implementation` (spike) within 2 min |
 | Plan approval | Add `plan-approved` label | Ticket advances to `AI Implementation` |
 | Impl approval | Add `impl-approved` label | Ticket advances to `Ready To Ship - AI` |
@@ -167,11 +167,11 @@ Work through the verification table in order. Use a **test spike ticket** first 
 If anything is broken and you need to revert immediately:
 
 ```bash
-pipe-stop
+agentic-dev-pipe stop
 cd ~/Documents/Grindr/AgecticPipeline
 git checkout main          # or whichever branch was running before
-pipe-start
-pipe-poller-log            # confirm "polling board..." appears
+agentic-dev-pipe start
+agentic-dev-pipe poller    # confirm "polling board..." appears
 ```
 
 The old `~/.pipeline/state.json` is untouched by the new code, so the old daemon picks up existing ticket state correctly.
