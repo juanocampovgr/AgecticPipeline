@@ -77,7 +77,7 @@ def cmd_start() -> None:
         print(f"launchctl load failed: {result.stderr.strip() or result.stdout.strip()}")
 
 
-def cmd_stop() -> None:
+def cmd_stop(force: bool = False) -> None:
     result = subprocess.run(
         ["launchctl", "unload", str(PLIST_PATH)],
         capture_output=True, text=True,
@@ -87,9 +87,27 @@ def cmd_stop() -> None:
     else:
         print(f"launchctl unload: {result.stderr.strip() or result.stdout.strip()}")
 
+    sys.path.insert(0, str(PIPELINE_ROOT))
+    try:
+        import process_utils
+        procs = process_utils.find_pipeline_claude_pids()
+        if procs:
+            tickets = sorted({t for _, t in procs if t})
+            ticket_str = ", ".join(map(str, tickets)) if tickets else "unknown"
+            print(f"\n⚠️  {len(procs)} pipeline Claude process(es) still running "
+                  f"(tickets: {ticket_str}).")
+            print("These include in-flight work and Terminal sessions you may be watching.")
+            if force or input("Kill them all? [y/N] ").strip().lower() in ("y", "yes"):
+                process_utils.kill_pids([p for p, _ in procs])
+                print(f"killed {len(procs)} process(es)")
+            else:
+                print("Left running. Re-run with `agentic-dev-pipe stop --force` to kill.")
+    except ImportError:
+        pass
+
 
 def cmd_restart() -> None:
-    cmd_stop()
+    cmd_stop(force=True)
     time.sleep(1)
     cmd_start()
 
@@ -448,14 +466,23 @@ COMMANDS = {
 
 
 def usage() -> None:
-    print("usage: agentic-dev-pipe {start|stop|restart|status|metrics|logs|poller|errors|graph}")
+    print("usage: agentic-dev-pipe {start|stop [--force]|restart|status|metrics|logs|poller|errors|graph}")
 
 
 def main() -> None:
-    if len(sys.argv) != 2 or sys.argv[1] not in COMMANDS:
+    args = sys.argv[1:]
+    if not args or args[0] not in COMMANDS:
         usage()
         sys.exit(1)
-    COMMANDS[sys.argv[1]]()
+    cmd = args[0]
+    if cmd == "stop":
+        force = len(args) > 1 and args[1] == "--force"
+        cmd_stop(force=force)
+    else:
+        if len(args) != 1:
+            usage()
+            sys.exit(1)
+        COMMANDS[cmd]()
 
 
 if __name__ == "__main__":

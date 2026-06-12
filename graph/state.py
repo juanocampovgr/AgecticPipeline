@@ -12,6 +12,8 @@ class TicketState(TypedDict, total=False):
     repo_full: str          # "owner/repo"
     is_spike: bool
     labels: list        # GitHub issue labels at thread-start time
+    jira_ticket_id: str     # Jira ID parsed from title/body, e.g. "ANDROID-1234"; empty if none
+    entry_point: str        # "plan" (default) | "implement" — alternate graph entry for recovery
 
     # ── Plan stage ────────────────────────────────────────────────────────────
     plan_content: str

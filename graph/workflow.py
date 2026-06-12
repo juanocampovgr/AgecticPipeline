@@ -26,7 +26,7 @@ from graph.nodes import (
     node_spawn_fix_ci, node_wait_fix_ci_marker,
     node_spawn_respond_to_review, node_wait_respond_marker,
     node_spawn_followups, node_wait_followups_marker,
-    node_done, node_needs_human,
+    node_done, node_needs_human, node_escalate_error,
     route_entry, route_plan_marker, route_impl_marker, route_self_review,
     route_impl_approval, route_ship_marker, route_monitor_pr, route_fix_ci, route_respond,
 )
@@ -60,20 +60,22 @@ def build_workflow(checkpointer):
     builder.add_node("wait_followups",        node_wait_followups_marker)
     builder.add_node("done",                  node_done)
     builder.add_node("needs_human",           node_needs_human)
+    builder.add_node("escalate_error",        node_escalate_error)
 
     # ── Entry point ───────────────────────────────────────────────────────────
     builder.set_entry_point("route_entry")
 
     builder.add_conditional_edges("route_entry", route_entry, {
-        "normal": "spawn_plan",
-        "spike":  "spawn_implement",
+        "normal":    "spawn_plan",
+        "spike":     "spawn_implement",
+        "implement": "spawn_implement",
     })
 
     # ── Plan path (non-spike) ─────────────────────────────────────────────────
     builder.add_edge("spawn_plan", "wait_plan")
     builder.add_conditional_edges("wait_plan", route_plan_marker, {
         "done":  "move_to_plan_review",
-        "error": "needs_human",
+        "error": "escalate_error",
     })
     builder.add_edge("move_to_plan_review", "wait_plan_approval")
     builder.add_edge("wait_plan_approval",  "spawn_implement")
@@ -83,7 +85,7 @@ def build_workflow(checkpointer):
     builder.add_conditional_edges("wait_implement", route_impl_marker, {
         "self_review": "spawn_self_review",   # non-spike success
         "spike_done":  "move_to_impl_review", # spike success (skip self-review)
-        "error":       "needs_human",
+        "error":       "escalate_error",
     })
 
     # ── Self-review (non-spike only) ──────────────────────────────────────────
@@ -105,7 +107,8 @@ def build_workflow(checkpointer):
     builder.add_edge("spawn_ship",     "wait_ship")
     builder.add_conditional_edges("wait_ship", route_ship_marker, {
         "done":  "move_to_in_pr",
-        "error": "needs_human",
+        "error": "escalate_error",
+        "retry": "spawn_ship",
     })
     builder.add_edge("move_to_in_pr",  "monitor_pr")
     builder.add_conditional_edges("monitor_pr", route_monitor_pr, {
@@ -134,8 +137,9 @@ def build_workflow(checkpointer):
     builder.add_edge("wait_followups",    "done")
 
     # ── Terminal edges ────────────────────────────────────────────────────────
-    builder.add_edge("done",         END)
-    builder.add_edge("needs_human",  END)
+    builder.add_edge("done",            END)
+    builder.add_edge("needs_human",     END)
+    builder.add_edge("escalate_error",  END)
 
     return builder.compile(checkpointer=checkpointer)
 

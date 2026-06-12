@@ -44,13 +44,13 @@ def _status_map() -> dict[str, str]:
 # ── Entry / routing ───────────────────────────────────────────────────────────
 
 async def node_route_entry(state: TicketState) -> dict:
-    """Move ticket off 'Ready To Pick Up' and set is_spike."""
-    from pipeline_poller import _is_spike_state  # noqa: PLC0415
+    """Move ticket to its target stage and set is_spike."""
     import httpx as _httpx
 
     is_spike = state.get("is_spike", False)
-    target = "AI Implementation" if is_spike else "AI Planning"
-    _log(f"  #{state['ticket_number']}: route_entry → '{target}' (spike={is_spike})")
+    entry = state.get("entry_point", "plan")
+    target = "AI Implementation" if (is_spike or entry == "implement") else "AI Planning"
+    _log(f"  #{state['ticket_number']}: route_entry → '{target}' (spike={is_spike}, entry={entry})")
 
     async with _httpx.AsyncClient(timeout=30) as client:
         await _move_status(
@@ -63,12 +63,16 @@ async def node_route_entry(state: TicketState) -> dict:
 # ── Plan stage ────────────────────────────────────────────────────────────────
 
 async def node_spawn_plan(state: TicketState) -> dict:
-    from pipeline_poller import spawn_headless, AI_STAGES  # noqa: PLC0415
+    from pipeline_poller import spawn_headless, AI_STAGES, STALE_THRESHOLD  # noqa: PLC0415
     cfg = AI_STAGES["AI Planning"]
     ticket = state["ticket_number"]
+    fired_at = time.time() - 5  # stamp before blocking call; buffer covers whole-second createdAt granularity
     _log(f"  #{ticket}: spawning plan")
-    run_id = await spawn_headless("AI Planning", cfg["command"], cfg["tools"], ticket)
-    return {"last_run_id": run_id, "last_fired_at": time.time()}
+    run_id = await spawn_headless(
+        "AI Planning", cfg["command"], cfg["tools"], ticket,
+        timeout_seconds=STALE_THRESHOLD.get("AI Planning"),
+    )
+    return {"last_run_id": run_id, "last_fired_at": fired_at}
 
 
 async def node_wait_plan_marker(state: TicketState) -> dict:
@@ -97,6 +101,7 @@ async def node_spawn_implement(state: TicketState) -> dict:
         spawn_headless, spawn_terminal, setup_worktree,
         kill_existing_claude_for_ticket,
         AI_STAGES, REPO_PATH_MAP, ANDROID_REPO_PATH, IOS_REPO_PATH, BACKEND_REPO_PATH,
+        STALE_THRESHOLD,
     )
 
     ticket = state["ticket_number"]
@@ -104,11 +109,13 @@ async def node_spawn_implement(state: TicketState) -> dict:
 
     if is_spike:
         cfg = {"command": "/spike-tickets", "tools": AI_STAGES["AI Implementation"]["tools"]}
+        fired_at = time.time() - 5  # stamp before blocking call
         _log(f"  #{ticket}: spawning spike impl (headless)")
         run_id = await spawn_headless(
             "AI Implementation", cfg["command"], cfg["tools"], ticket,
+            timeout_seconds=STALE_THRESHOLD.get("AI Implementation"),
         )
-        return {"last_run_id": run_id, "last_fired_at": time.time()}
+        return {"last_run_id": run_id, "last_fired_at": fired_at}
 
     # Non-spike: terminal spawn with worktree
     cfg = AI_STAGES["AI Implementation"]
@@ -140,8 +147,11 @@ async def node_spawn_implement(state: TicketState) -> dict:
         }
 
     kill_existing_claude_for_ticket(ticket)
+    branch_id = state.get("jira_ticket_id", "")
+    from pipeline_poller import _get_repo_semaphore  # noqa: PLC0415
     try:
-        worktree_path = setup_worktree(repo_local, ticket)
+        async with _get_repo_semaphore(state["repo"]):
+            worktree_path = setup_worktree(repo_local, ticket, branch_id)
     except Exception as e:
         err = f"Worktree setup failed: {e}"
         _log(f"  #{ticket}: ERROR: {err}")
@@ -150,12 +160,13 @@ async def node_spawn_implement(state: TicketState) -> dict:
             "_impl_marker_outcome": "error",
         }
 
+    fired_at = time.time() - 5
     run_id = spawn_terminal(
         "AI Implementation", cfg["command"], cfg["tools"], ticket, worktree_path,
     )
     return {
         "last_run_id": run_id,
-        "last_fired_at": time.time(),
+        "last_fired_at": fired_at,
         "worktree_path": worktree_path,
         "repo_local_path": repo_local,
     }
@@ -171,16 +182,14 @@ async def node_wait_impl_marker(state: TicketState) -> dict:
 async def node_spawn_self_review(state: TicketState) -> dict:
     from pipeline_poller import spawn_headless  # noqa: PLC0415
     ticket = state["ticket_number"]
-    repo = state.get("repo", "")
-    # Android gets grindr_code_review; others get /code-review
-    review_skill = "/grindr-code-review" if "android" in repo.lower() else "/code-review"
-    command = f"/self-review-ticket --ticket {ticket} --review-skill '{review_skill}'"
+    fired_at = time.time() - 5  # stamp before blocking call
     _log(f"  #{ticket}: spawning self-review")
     run_id = await spawn_headless(
         "Self Review", "/self-review-ticket",
         "Bash,Read,Grep,Glob,Edit,Write,Agent", ticket,
+        timeout_seconds=1800,
     )
-    return {"last_run_id": run_id, "last_fired_at": time.time()}
+    return {"last_run_id": run_id, "last_fired_at": fired_at}
 
 
 async def node_wait_self_review_marker(state: TicketState) -> dict:
@@ -203,14 +212,16 @@ async def node_move_to_impl_review(state: TicketState) -> dict:
     if not state.get("is_spike") and state.get("worktree_path") and state.get("repo_local_path"):
         from pipeline_poller import cleanup_worktree  # noqa: PLC0415
         _log(f"  #{ticket}: cleaning worktree before impl review")
-        cleanup_worktree(state["worktree_path"], state["repo_local_path"], ticket)
+        branch_id = state.get("jira_ticket_id", "")
+        cleanup_worktree(state["worktree_path"], state["repo_local_path"], ticket, branch_id)
 
     async with httpx.AsyncClient(timeout=30) as client:
         await _move_status(
             client, state["item_id"], "Ready to review Implementation",
             **_cfg(), status_map=_status_map(),
         )
-    return {"worktree_path": "", "repo_local_path": ""}
+    # Keep repo_local_path — node_spawn_ship needs it to re-setup the worktree after the human gate
+    return {"worktree_path": ""}
 
 
 async def node_wait_impl_approval(state: TicketState) -> dict:
@@ -221,26 +232,81 @@ async def node_wait_impl_approval(state: TicketState) -> dict:
 # ── Ship stage ────────────────────────────────────────────────────────────────
 
 async def node_spawn_ship(state: TicketState) -> dict:
-    from pipeline_poller import spawn_headless, AI_STAGES  # noqa: PLC0415
+    from pipeline_poller import (  # noqa: PLC0415
+        spawn_terminal, setup_worktree, _get_repo_semaphore, _infer_repo_from_plan,
+        AI_STAGES, REPO_PATH_MAP, ANDROID_REPO_PATH, IOS_REPO_PATH, BACKEND_REPO_PATH,
+    )
     ticket = state["ticket_number"]
     cfg = AI_STAGES["Ready To Ship - AI"]
-    _log(f"  #{ticket}: spawning ship")
-    run_id = await spawn_headless("Ready To Ship - AI", cfg["command"], cfg["tools"], ticket)
-    return {"last_run_id": run_id, "last_fired_at": time.time()}
+
+    # Resolve local repo path (preserved in state from impl stage)
+    repo_local = state.get("repo_local_path", "") or REPO_PATH_MAP.get(state["repo"], "")
+    if not repo_local:
+        labels_lower = [l.lower() for l in state.get("labels", [])] if state.get("labels") else []
+        if "android" in labels_lower:
+            repo_local = ANDROID_REPO_PATH
+        elif "ios" in labels_lower:
+            repo_local = IOS_REPO_PATH
+        elif "backend" in labels_lower:
+            repo_local = BACKEND_REPO_PATH
+    if not repo_local:
+        async with httpx.AsyncClient(timeout=30) as client:
+            repo_local = await _infer_repo_from_plan(client, state["repo_full"], ticket)
+    if not repo_local:
+        err = f"Cannot determine local repo for ship of '{state['repo']}'"
+        _log(f"  #{ticket}: ERROR: {err}")
+        return {"errors": (state.get("errors") or []) + [err], "_ship_marker_outcome": "error"}
+
+    # Re-setup worktree from the existing branch (worktree was cleaned after impl review)
+    branch_id = state.get("jira_ticket_id", "")
+    try:
+        async with _get_repo_semaphore(state["repo"]):
+            worktree_path = setup_worktree(repo_local, ticket, branch_id)
+    except Exception as e:
+        err = f"Ship worktree setup failed: {e}"
+        _log(f"  #{ticket}: ERROR: {err}")
+        return {"errors": (state.get("errors") or []) + [err], "_ship_marker_outcome": "error"}
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        await _move_status(
+            client, state["item_id"], "Ready To Ship - AI",
+            **_cfg(), status_map=_status_map(),
+        )
+
+    fired_at = time.time() - 5
+    _log(f"  #{ticket}: spawning ship (terminal)")
+    run_id = spawn_terminal(
+        "Ready To Ship - AI", cfg["command"], cfg["tools"], ticket, worktree_path,
+    )
+    return {
+        "last_run_id": run_id,
+        "last_fired_at": fired_at,
+        "worktree_path": worktree_path,
+        "repo_local_path": repo_local,
+    }
 
 
 async def node_wait_ship_marker(state: TicketState) -> dict:
     result = interrupt("waiting_ship_marker")
-    return {"_ship_marker_outcome": result.get("outcome", "done")}
+    updates: dict = {"_ship_marker_outcome": result.get("outcome", "done")}
+    if "pr_number" in result:
+        updates["pr_number"] = result["pr_number"]
+    return updates
 
 
 async def node_move_to_in_pr(state: TicketState) -> dict:
+    ticket = state["ticket_number"]
+    if state.get("worktree_path") and state.get("repo_local_path"):
+        from pipeline_poller import cleanup_worktree  # noqa: PLC0415
+        _log(f"  #{ticket}: cleaning ship worktree before In PR")
+        branch_id = state.get("jira_ticket_id", "")
+        cleanup_worktree(state["worktree_path"], state["repo_local_path"], ticket, branch_id)
     async with httpx.AsyncClient(timeout=30) as client:
         await _move_status(
             client, state["item_id"], "In PR",
             **_cfg(), status_map=_status_map(),
         )
-    return {}
+    return {"worktree_path": "", "repo_local_path": ""}
 
 
 # ── PR monitoring ─────────────────────────────────────────────────────────────
@@ -254,24 +320,59 @@ async def node_monitor_pr(state: TicketState) -> dict:
 # ── CI auto-fix ───────────────────────────────────────────────────────────────
 
 async def node_spawn_fix_ci(state: TicketState) -> dict:
-    from pipeline_poller import spawn_headless  # noqa: PLC0415
+    from pipeline_poller import (  # noqa: PLC0415
+        spawn_terminal, setup_worktree, _get_repo_semaphore, _infer_repo_from_plan,
+        REPO_PATH_MAP, ANDROID_REPO_PATH, IOS_REPO_PATH, BACKEND_REPO_PATH,
+    )
     ticket = state["ticket_number"]
     pr_number = state.get("pr_number", 0)
-    _log(f"  #{ticket}: spawning CI fix for PR #{pr_number}")
+
+    repo_local = state.get("repo_local_path", "") or REPO_PATH_MAP.get(state["repo"], "")
+    if not repo_local:
+        labels_lower = [l.lower() for l in state.get("labels", [])] if state.get("labels") else []
+        if "android" in labels_lower:
+            repo_local = ANDROID_REPO_PATH
+        elif "ios" in labels_lower:
+            repo_local = IOS_REPO_PATH
+        elif "backend" in labels_lower:
+            repo_local = BACKEND_REPO_PATH
+    if not repo_local:
+        async with httpx.AsyncClient(timeout=30) as client:
+            repo_local = await _infer_repo_from_plan(client, state["repo_full"], ticket)
+    if not repo_local:
+        err = f"Cannot determine local repo for fix-ci of '{state['repo']}'"
+        _log(f"  #{ticket}: ERROR: {err}")
+        return {"errors": (state.get("errors") or []) + [err], "_fix_ci_outcome": "needs_human"}
+
+    branch_id = state.get("jira_ticket_id", "")
+    base = f"origin/juanocampovgr/{branch_id}" if branch_id else f"origin/juanocampovgr/{ticket}"
+    try:
+        async with _get_repo_semaphore(state["repo"]):
+            worktree_path = setup_worktree(repo_local, ticket, branch_id, base=base)
+    except Exception as e:
+        err = f"Fix-CI worktree setup failed: {e}"
+        _log(f"  #{ticket}: ERROR: {err}")
+        return {"errors": (state.get("errors") or []) + [err], "_fix_ci_outcome": "needs_human"}
+
+    _log(f"  #{ticket}: spawning CI fix (terminal) for PR #{pr_number}")
     async with httpx.AsyncClient(timeout=30) as client:
         await _move_status(
             client, state["item_id"], "AI-PR Assistance",
             **_cfg(), status_map=_status_map(),
         )
-    run_id = await spawn_headless(
+
+    fired_at = time.time() - 5
+    run_id = spawn_terminal(
         "AI-PR Assistance",
         f"/fix-ci-failure --pr {pr_number}",
         "Bash,Read,Grep,Glob,Edit,Write,Agent",
-        ticket,
+        ticket, worktree_path,
     )
     return {
         "last_run_id": run_id,
-        "last_fired_at": time.time(),
+        "last_fired_at": fired_at,
+        "worktree_path": worktree_path,
+        "repo_local_path": repo_local,
         "ci_fix_count": state.get("ci_fix_count", 0) + 1,
     }
 
@@ -284,24 +385,59 @@ async def node_wait_fix_ci_marker(state: TicketState) -> dict:
 # ── PR review comment responder ───────────────────────────────────────────────
 
 async def node_spawn_respond_to_review(state: TicketState) -> dict:
-    from pipeline_poller import spawn_headless  # noqa: PLC0415
+    from pipeline_poller import (  # noqa: PLC0415
+        spawn_terminal, setup_worktree, _get_repo_semaphore, _infer_repo_from_plan,
+        REPO_PATH_MAP, ANDROID_REPO_PATH, IOS_REPO_PATH, BACKEND_REPO_PATH,
+    )
     ticket = state["ticket_number"]
     pr_number = state.get("pr_number", 0)
-    _log(f"  #{ticket}: spawning respond-to-review for PR #{pr_number}")
+
+    repo_local = state.get("repo_local_path", "") or REPO_PATH_MAP.get(state["repo"], "")
+    if not repo_local:
+        labels_lower = [l.lower() for l in state.get("labels", [])] if state.get("labels") else []
+        if "android" in labels_lower:
+            repo_local = ANDROID_REPO_PATH
+        elif "ios" in labels_lower:
+            repo_local = IOS_REPO_PATH
+        elif "backend" in labels_lower:
+            repo_local = BACKEND_REPO_PATH
+    if not repo_local:
+        async with httpx.AsyncClient(timeout=30) as client:
+            repo_local = await _infer_repo_from_plan(client, state["repo_full"], ticket)
+    if not repo_local:
+        err = f"Cannot determine local repo for respond-to-review of '{state['repo']}'"
+        _log(f"  #{ticket}: ERROR: {err}")
+        return {"errors": (state.get("errors") or []) + [err], "_respond_outcome": "needs_human"}
+
+    branch_id = state.get("jira_ticket_id", "")
+    base = f"origin/juanocampovgr/{branch_id}" if branch_id else f"origin/juanocampovgr/{ticket}"
+    try:
+        async with _get_repo_semaphore(state["repo"]):
+            worktree_path = setup_worktree(repo_local, ticket, branch_id, base=base)
+    except Exception as e:
+        err = f"Respond-to-review worktree setup failed: {e}"
+        _log(f"  #{ticket}: ERROR: {err}")
+        return {"errors": (state.get("errors") or []) + [err], "_respond_outcome": "needs_human"}
+
+    _log(f"  #{ticket}: spawning respond-to-review (terminal) for PR #{pr_number}")
     async with httpx.AsyncClient(timeout=30) as client:
         await _move_status(
             client, state["item_id"], "AI-PR Assistance",
             **_cfg(), status_map=_status_map(),
         )
-    run_id = await spawn_headless(
+
+    fired_at = time.time() - 5
+    run_id = spawn_terminal(
         "AI-PR Assistance",
         f"/respond-to-review --pr {pr_number}",
         "Bash,Read,Grep,Glob,Edit,Write,Agent",
-        ticket,
+        ticket, worktree_path,
     )
     return {
         "last_run_id": run_id,
-        "last_fired_at": time.time(),
+        "last_fired_at": fired_at,
+        "worktree_path": worktree_path,
+        "repo_local_path": repo_local,
         "review_comment_round": state.get("review_comment_round", 0) + 1,
     }
 
@@ -322,13 +458,15 @@ async def node_spawn_followups(state: TicketState) -> dict:
             client, state["item_id"], "Ready To Ship - AI",
             **_cfg(), status_map=_status_map(),
         )
+    fired_at = time.time() - 5  # stamp before blocking call
     run_id = await spawn_headless(
         "Ready To Ship - AI",
         "/spike-tickets --create-followups",
         "Bash,Read,Grep,Glob,Agent",
         ticket,
+        timeout_seconds=1800,
     )
-    return {"last_run_id": run_id, "last_fired_at": time.time()}
+    return {"last_run_id": run_id, "last_fired_at": fired_at}
 
 
 async def node_wait_followups_marker(state: TicketState) -> dict:
@@ -353,7 +491,7 @@ async def node_needs_human(state: TicketState) -> dict:
     ticket = state["ticket_number"]
     errors = state.get("errors") or []
     error_summary = "; ".join(errors) if errors else "Pipeline could not proceed automatically."
-    _log(f"  #{ticket}: needs_human → posting comment and moving to Needs Human")
+    _log(f"  #{ticket}: needs_human → posting comment and moving to Error")
     async with httpx.AsyncClient(timeout=30) as client:
         body = (
             f"⚠️ **Pipeline paused — human review needed**\n\n"
@@ -362,7 +500,26 @@ async def node_needs_human(state: TicketState) -> dict:
         )
         await post_issue_comment(client, state["issue_node_id"], body)
         await _move_status(
-            client, state["item_id"], "Needs Human",
+            client, state["item_id"], "Error",
+            **_cfg(), status_map=_status_map(),
+        )
+    return {}
+
+
+async def node_escalate_error(state: TicketState) -> dict:
+    ticket = state["ticket_number"]
+    errors = state.get("errors") or []
+    error_summary = "; ".join(errors) if errors else "Pipeline encountered an unrecoverable error."
+    _log(f"  #{ticket}: escalate_error → posting comment and moving to Error")
+    async with httpx.AsyncClient(timeout=30) as client:
+        body = (
+            f"🚨 **Pipeline auto-escalated to Error**\n\n"
+            f"{error_summary}\n\n"
+            f"<!-- pipeline-error:auto-escalated -->"
+        )
+        await post_issue_comment(client, state["issue_node_id"], body)
+        await _move_status(
+            client, state["item_id"], "Error",
             **_cfg(), status_map=_status_map(),
         )
     return {}
@@ -371,7 +528,11 @@ async def node_needs_human(state: TicketState) -> dict:
 # ── Conditional edge routing functions ───────────────────────────────────────
 
 def route_entry(state: TicketState) -> str:
-    return "spike" if state.get("is_spike") else "normal"
+    if state.get("is_spike"):
+        return "spike"
+    if state.get("entry_point") == "implement":
+        return "implement"
+    return "normal"
 
 
 def route_plan_marker(state: TicketState) -> str:

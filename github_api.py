@@ -276,6 +276,30 @@ async def issue_has_marker(
     return False
 
 
+async def find_marker_comment(
+    client: httpx.AsyncClient,
+    repo_full: str,
+    number: int,
+    marker: str,
+    after_timestamp: float | None = None,
+) -> str | None:
+    """Return body of the first comment containing marker, or None."""
+    owner, repo = repo_full.split("/")
+    data = await gql_with_retry(client, ISSUE_COMMENTS_QUERY, {
+        "owner": owner, "repo": repo, "number": number,
+    })
+    comments = data["repository"]["issue"]["comments"]["nodes"]
+    for c in comments:
+        if marker not in (c.get("body") or ""):
+            continue
+        if after_timestamp is not None:
+            created = datetime.fromisoformat(c["createdAt"].replace("Z", "+00:00"))
+            if created.timestamp() <= after_timestamp:
+                continue
+        return c.get("body") or ""
+    return None
+
+
 # ── Status / label mutations ──────────────────────────────────────────────────
 
 async def move_status(
@@ -316,6 +340,18 @@ async def remove_label(
         "labelableId": issue_node_id,
         "labelIds":    [label["id"]],
     })
+
+
+async def fetch_issue_body(
+    client: httpx.AsyncClient,
+    repo_full: str,
+    number: int,
+) -> str:
+    """Fetch the body text of a GitHub issue."""
+    owner, repo = repo_full.split("/")
+    data = await gql_with_retry(client, ISSUE_COMMENTS_QUERY,
+        {"owner": owner, "repo": repo, "number": number})
+    return (data["repository"]["issue"].get("body") or "")
 
 
 async def post_issue_comment(

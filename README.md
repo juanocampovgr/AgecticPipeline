@@ -33,20 +33,76 @@ The daemon runs as a macOS launchd service (`dev.juan.pipeline-poller`).
 
 ### Graph Topology
 
-```
-Non-spike:
-  route_entry → spawn_plan → wait_plan → move_to_plan_review
-             → wait_plan_approval → spawn_implement → wait_implement
-             → spawn_self_review → wait_self_review
-             → move_to_impl_review → wait_impl_approval
-             → spawn_ship → wait_ship → move_to_in_pr
-             → monitor_pr → [done | fix_ci | respond | needs_human]
+```mermaid
+flowchart TD
+    START([START]) --> route_entry{route_entry}
 
-Spike:
-  route_entry → spawn_implement → wait_implement → move_to_impl_review
-             → wait_impl_approval
-             → [impl-approved → done | followup-approved → spawn_followups → done]
+    route_entry -->|normal| spawn_plan[spawn_plan]
+    route_entry -->|spike / implement| spawn_implement[spawn_implement]
+
+    spawn_plan --> wait_plan([wait_plan])
+    wait_plan -->|done| move_to_plan_review[move_to_plan_review]
+    wait_plan -->|error| escalate_error
+
+    move_to_plan_review --> wait_plan_approval([wait_plan_approval\ngate: plan-approved])
+    wait_plan_approval --> spawn_implement
+
+    spawn_implement --> wait_implement([wait_implement])
+    wait_implement -->|self_review| spawn_self_review[spawn_self_review]
+    wait_implement -->|spike_done| move_to_impl_review[move_to_impl_review]
+    wait_implement -->|error| escalate_error
+
+    spawn_self_review --> wait_self_review([wait_self_review])
+    wait_self_review -->|proceed| move_to_impl_review
+    wait_self_review -->|retry| spawn_implement
+
+    move_to_impl_review --> wait_impl_approval([wait_impl_approval\ngate: impl-approved])
+    wait_impl_approval -->|ship| spawn_ship[spawn_ship]
+    wait_impl_approval -->|spike_done| done
+    wait_impl_approval -->|followups| spawn_followups[spawn_followups]
+
+    spawn_ship --> wait_ship([wait_ship])
+    wait_ship -->|done| move_to_in_pr[move_to_in_pr]
+    wait_ship -->|error| escalate_error
+    wait_ship -->|retry| spawn_ship
+
+    move_to_in_pr --> monitor_pr([monitor_pr])
+    monitor_pr -->|done| done
+    monitor_pr -->|fix_ci| spawn_fix_ci[spawn_fix_ci]
+    monitor_pr -->|respond| spawn_respond[spawn_respond]
+    monitor_pr -->|needs_human| needs_human
+
+    spawn_fix_ci --> wait_fix_ci([wait_fix_ci])
+    wait_fix_ci -->|done| monitor_pr
+    wait_fix_ci -->|needs_human| needs_human
+
+    spawn_respond --> wait_respond([wait_respond])
+    wait_respond -->|done| monitor_pr
+    wait_respond -->|needs_human| needs_human
+
+    spawn_followups --> wait_followups([wait_followups])
+    wait_followups --> done
+
+    done([done]) --> END([END])
+    needs_human([needs_human]) --> END
+    escalate_error([escalate_error]) --> END
+
+    classDef spawn fill:#dbeafe,stroke:#3b82f6,color:#1e3a8a
+    classDef wait fill:#fef9c3,stroke:#eab308,color:#713f12
+    classDef move fill:#f3f4f6,stroke:#6b7280,color:#111827
+    classDef terminal fill:#dcfce7,stroke:#22c55e,color:#14532d
+    classDef error fill:#fee2e2,stroke:#ef4444,color:#7f1d1d
+    classDef route fill:#ede9fe,stroke:#8b5cf6,color:#3b0764
+
+    class spawn_plan,spawn_implement,spawn_self_review,spawn_ship,spawn_fix_ci,spawn_respond,spawn_followups spawn
+    class wait_plan,wait_plan_approval,wait_implement,wait_self_review,wait_impl_approval,wait_ship,monitor_pr,wait_fix_ci,wait_respond,wait_followups wait
+    class move_to_plan_review,move_to_impl_review,move_to_in_pr move
+    class done terminal
+    class needs_human,escalate_error error
+    class route_entry route
 ```
+
+Node color key: **blue** = AI spawn · **yellow** = interrupt/wait · **gray** = board move · **green** = success terminal · **red** = error terminal · **purple** = router
 
 ### Board Statuses
 
@@ -60,7 +116,7 @@ Spike:
 | Ready To Ship - AI | AI | Claude prepares and ships the PR |
 | In PR | Human | PR open, awaiting merge / monitoring CI |
 | AI-PR Assistance | AI | Claude is actively fixing CI or implementing review comments |
-| Needs Human | Human | Unrecoverable error or retry limit reached |
+| Error | Human | Unrecoverable error or retry limit reached |
 | Done | — | Complete |
 
 ### Human Gates
@@ -112,8 +168,8 @@ Inserted between implementation and human review for non-spike tickets:
 When a PR's GitHub Actions run fails, `monitor_pr` classifies the failure:
 
 - **In-scope** (lint, formatting, compilation, test flake on current-branch changes): ticket → `AI-PR Assistance`, Claude fixes and pushes, posts a comment with fix summary + commit link, ticket returns to `In PR`, CI re-runs.
-- **Out-of-scope** (pre-existing failure, infra issue, unrelated test): Claude posts an explanation comment, ticket → `Needs Human`.
-- Max 3 in-scope fix attempts before escalating to `Needs Human`.
+- **Out-of-scope** (pre-existing failure, infra issue, unrelated test): Claude posts an explanation comment, ticket → `Error`.
+- Max 3 in-scope fix attempts before escalating to `Error`.
 
 ### PR Review Comment Responder
 
@@ -123,7 +179,7 @@ When human adds `comments-approved` label while ticket is `In PR`:
 2. Claude fetches all unresolved PR comments and implements the requested changes.
 3. Claude replies `"Done"` on each comment thread it addressed.
 4. Ticket returns to `In PR`, `comments-approved` label removed.
-5. After 2 unresolved rounds → escalates to `Needs Human`.
+5. After 2 unresolved rounds → escalates to `Error`.
 
 ## Features
 
@@ -143,8 +199,8 @@ For each implementation task, the poller:
 
 ### Spawn Modes
 
-- **Headless** (Planning, Self-Review, Shipping, CI Fix, Review Response) — Async subprocess; output captured to per-run log files in `~/.pipeline/logs/`.
-- **Terminal** (Implementation) — Opens a Terminal.app window via AppleScript so the developer can watch the live session.
+- **Headless** (Planning, Self-Review) — Async subprocess; output captured to per-run log files in `~/.pipeline/logs/`.
+- **Terminal** (Implementation, Shipping, CI Fix, Review Response) — Opens a Terminal.app window via AppleScript so the developer can watch the live session.
 
 ### Per-Repo Concurrency
 
@@ -178,14 +234,14 @@ Two complementary persistence layers:
 
 ### Error Handling & Recovery
 
-- Missing repo path → posts a failure comment, moves ticket to **Needs Human**.
-- Worktree creation failure → posts a failure comment, moves ticket to **Needs Human**.
-- Terminal spawn failure → posts a failure comment, moves ticket to **Needs Human**.
+- Missing repo path → posts a failure comment, moves ticket to **Error**.
+- Worktree creation failure → posts a failure comment, moves ticket to **Error**.
+- Terminal spawn failure → posts a failure comment, moves ticket to **Error**.
 - GitHub GraphQL errors → retried with exponential backoff (2s, 4s, 8s).
 - Auth errors (401/403) → fail fast, no retry.
-- Self-review failures → re-implement loop (max 2 retries before Needs Human).
-- CI fix failures → fix loop (max 3 retries before Needs Human).
-- Review comment loops → max 2 rounds before Needs Human.
+- Self-review failures → re-implement loop (max 2 retries before Error).
+- CI fix failures → fix loop (max 3 retries before Error).
+- Review comment loops → max 2 rounds before Error.
 
 ## CLI Reference
 
@@ -229,8 +285,6 @@ Set via environment variables or a `.env` file in the pipeline root.
 | `PROJECT_NUMBER` | Project board number |
 | `PROJECT_NODE_ID` | GraphQL node ID of the project |
 | `STATUS_FIELD_ID` | GraphQL node ID of the status field |
-| `STATUS_ID_AI_PR_ASSISTANCE` | GraphQL option ID for "AI-PR Assistance" status |
-| `STATUS_ID_NEEDS_HUMAN` | GraphQL option ID for "Needs Human" status |
 | `GITHUB_TOKEN` | GitHub PAT (falls back to `gh auth token`) |
 
 ### Optional
