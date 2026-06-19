@@ -3,6 +3,7 @@
 Graph topology:
   Non-spike: route_entry → spawn_plan → wait_plan → move_to_plan_review
              → wait_plan_approval → spawn_implement → wait_implement
+             → spawn_quality_check → wait_quality_check
              → spawn_self_review → wait_self_review
              → move_to_impl_review → wait_impl_approval
              → spawn_ship → wait_ship → move_to_in_pr
@@ -19,6 +20,7 @@ from graph.nodes import (
     node_route_entry,
     node_spawn_plan, node_wait_plan_marker, node_move_to_plan_review, node_wait_plan_approval,
     node_spawn_implement, node_wait_impl_marker,
+    node_spawn_quality_check, node_wait_quality_check,
     node_spawn_self_review, node_wait_self_review_marker,
     node_move_to_impl_review, node_wait_impl_approval,
     node_spawn_ship, node_wait_ship_marker, node_move_to_in_pr,
@@ -27,7 +29,7 @@ from graph.nodes import (
     node_spawn_respond_to_review, node_wait_respond_marker,
     node_spawn_followups, node_wait_followups_marker,
     node_done, node_needs_human, node_escalate_error,
-    route_entry, route_plan_marker, route_impl_marker, route_self_review,
+    route_entry, route_plan_marker, route_impl_marker, route_quality_check, route_self_review,
     route_impl_approval, route_ship_marker, route_monitor_pr, route_fix_ci, route_respond,
 )
 
@@ -44,6 +46,8 @@ def build_workflow(checkpointer):
     builder.add_node("wait_plan_approval",    node_wait_plan_approval)
     builder.add_node("spawn_implement",       node_spawn_implement)
     builder.add_node("wait_implement",        node_wait_impl_marker)
+    builder.add_node("spawn_quality_check",   node_spawn_quality_check)
+    builder.add_node("wait_quality_check",    node_wait_quality_check)
     builder.add_node("spawn_self_review",     node_spawn_self_review)
     builder.add_node("wait_self_review",      node_wait_self_review_marker)
     builder.add_node("move_to_impl_review",   node_move_to_impl_review)
@@ -83,16 +87,24 @@ def build_workflow(checkpointer):
     # ── Implement (shared: spike goes directly here) ──────────────────────────
     builder.add_edge("spawn_implement", "wait_implement")
     builder.add_conditional_edges("wait_implement", route_impl_marker, {
-        "self_review": "spawn_self_review",   # non-spike success
-        "spike_done":  "move_to_impl_review", # spike success (skip self-review)
-        "error":       "escalate_error",
+        "quality_check": "spawn_quality_check", # non-spike success → quality check
+        "spike_done":    "move_to_impl_review",  # spike success (skip quality check + self-review)
+        "error":         "escalate_error",
+    })
+
+    # ── Quality check (non-spike only) ───────────────────────────────────────
+    builder.add_edge("spawn_quality_check", "wait_quality_check")
+    builder.add_conditional_edges("wait_quality_check", route_quality_check, {
+        "proceed": "spawn_self_review",
+        "error":   "escalate_error",
     })
 
     # ── Self-review (non-spike only) ──────────────────────────────────────────
     builder.add_edge("spawn_self_review", "wait_self_review")
     builder.add_conditional_edges("wait_self_review", route_self_review, {
-        "proceed": "move_to_impl_review",
-        "retry":   "spawn_implement",
+        "proceed":  "move_to_impl_review",
+        "retry":    "spawn_implement",
+        "escalate": "escalate_error",
     })
 
     # ── Impl review gate (shared) ─────────────────────────────────────────────

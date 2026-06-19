@@ -48,26 +48,16 @@ git push -u origin HEAD
 ### 6. Create draft PR
 Fetch the issue title and body using `gh issue view <N> --json title,body`.
 
+**Title format:** `[Ticket-<N>] <friendly description of the ticket>` — derive a short, human-readable description from the issue title (not a verbatim copy; make it clear and concise).
+
+**PR body:** Invoke the `/grindr-pr-description` skill to generate the PR description. Pass the issue number, title, body, and plan comment as context.
+
+Then create the PR:
 ```bash
 gh pr create --draft --base main \
-  --title "[AI] <issue title>" \
-  --body "$(cat <<'EOF'
-## Summary
-Closes #<N>
-
-<brief summary of what was changed and why, derived from the issue body and plan comment>
-
-## Test plan
-- [ ] Verified with module-scoped unit tests
-- [ ] Lint passed
-- [ ] Detekt passed
-
-🤖 Generated with [Claude Code](https://claude.com/claude-code)
-EOF
-)"
+  --title "[Ticket-<N>] <friendly description>" \
+  --body "<output from /grindr-pr-description>"
 ```
-
-Title must be prefixed with `[AI] ` followed by the verbatim issue title.
 
 ### 7. Post done marker on issue #N
 ```bash

@@ -52,6 +52,7 @@ def _gh_token() -> str:
 
 
 GITHUB_TOKEN     = os.environ.get("GITHUB_TOKEN") or _gh_token()
+os.environ.setdefault("GITHUB_TOKEN", GITHUB_TOKEN)  # ensure github_api._get_token() finds it without shelling out
 PROJECT_OWNER    = os.environ["PROJECT_OWNER"]
 PROJECT_NUMBER   = int(os.environ["PROJECT_NUMBER"])
 PROJECT_NODE_ID  = os.environ["PROJECT_NODE_ID"]
@@ -70,9 +71,10 @@ REPO_PATH_MAP: dict[str, str] = {
 }
 
 STALE_THRESHOLD = {
-    "AI Planning":         int(os.environ.get("STALE_PLAN_SECONDS",  "900")),
-    "AI Implementation":   int(os.environ.get("STALE_IMPL_SECONDS",  "3600")),
-    "Ready To Ship - AI":  int(os.environ.get("STALE_SHIP_SECONDS",  "1800")),
+    "AI Planning":         int(os.environ.get("STALE_PLAN_SECONDS",    "900")),
+    "AI Implementation":   int(os.environ.get("STALE_IMPL_SECONDS",    "3600")),
+    "AI Quality Check":    int(os.environ.get("STALE_QUALITY_SECONDS", "1800")),
+    "Ready To Ship - AI":  int(os.environ.get("STALE_SHIP_SECONDS",    "1800")),
 }
 
 MIN_DESCRIPTION_CHARS = int(os.environ.get("MIN_DESCRIPTION_CHARS", "20"))
@@ -179,6 +181,13 @@ AI_STAGES = {
         "next_status":  "Ready to review Implementation",
         "spawn_mode":   "terminal",
     },
+    "AI Quality Check": {
+        "command":      "/quality-check",
+        "tools":        "Bash,Read,Grep,Glob,Edit,Write,Agent",
+        "done_marker":  "<!-- ai-quality:done -->",
+        "error_marker": "<!-- ai-quality:error -->",
+        "spawn_mode":   "terminal",
+    },
     "Ready To Ship - AI": {
         "command":      "/ship-tickets",
         "tools":        "Bash,Read,Grep,Glob,Edit,Write,Agent",
@@ -214,39 +223,6 @@ AI_STAGES = {
         "done_marker":  "<!-- ai-followups:done -->",
         "error_marker": "<!-- ai-followups:error -->",
         "spawn_mode":   "headless",
-    },
-}
-
-# ── Human-gate configs ────────────────────────────────────────────────────────
-
-HUMAN_GATES = {
-    "Ready to Review then Plan": {
-        "label": "plan-approved",
-        "next_status": "AI Implementation",
-    },
-    "Ready to review Implementation": {
-        "label": "impl-approved",
-        "next_status": "Ready To Ship - AI",
-    },
-}
-
-# New label gates (detected separately in reconcile loop)
-NEW_LABEL_GATES = {
-    "In PR": {
-        "comments-approved": {
-            "interrupt": "waiting_pr_outcome",
-            "resume_payload": {"outcome": "respond"},
-        },
-    },
-    "Ready to review Implementation": {
-        "followup-approved": {
-            "interrupt": "waiting_impl_approval",
-            "resume_payload": {"label": "followup-approved"},
-        },
-        "impl-approved": {
-            "interrupt": "waiting_impl_approval",
-            "resume_payload": {"label": "impl-approved"},
-        },
     },
 }
 
@@ -348,6 +324,7 @@ def post_failure_comment(repo_full: str, ticket: int, stage: str, error: str) ->
 INTERRUPT_TO_STAGE: dict[str, str] = {
     "waiting_plan_marker":        "AI Planning",
     "waiting_impl_marker":        "AI Implementation",
+    "waiting_quality_marker":     "AI Quality Check",
     "waiting_self_review_marker": "Self Review",
     "waiting_ship_marker":        "Ready To Ship - AI",
     "waiting_fix_ci_marker":      "AI-PR Assistance",
@@ -390,51 +367,70 @@ async def _escalate_to_error(client: httpx.AsyncClient, item: dict, reason: str)
 
 # ── Spawners ──────────────────────────────────────────────────────────────────
 
+# run_id → "timeout" | "crash:rc=N" — written by background watch tasks, consumed by _handle_interrupt
+_spawn_errors: dict[str, str] = {}
+
+
 async def spawn_headless(
     stage_status: str, command: str, allowed_tools: str, ticket: int,
     timeout_seconds: int | None = None,
 ) -> str:
+    """Launch a headless Claude process and return immediately (fire-and-forget).
+
+    A background asyncio task watches the process: on non-zero exit it writes to
+    _spawn_errors[run_id] so _handle_interrupt can detect the crash on the very
+    next poll cycle rather than waiting for the full stale threshold.
+    """
     run_id = f"{stage_status.replace(' ', '_')}-{ticket}-{uuid.uuid4().hex[:8]}"
     log_path = LOG_DIR / f"{run_id}.log"
-    lock = _ticket_locks.setdefault(ticket, asyncio.Lock())
-    async with lock, _get_total_semaphore():
-        cmd = [
-            CLAUDE_BIN,
-            "-p", f"{command} --ticket {ticket}",
-            "--allowedTools", allowed_tools,
-        ]
-        _log(f"headless spawn for #{ticket} → {log_path.name}")
-        with open(log_path, "wb") as logf:
-            logf.write(
-                f"=== run_id={run_id} ticket={ticket} stage='{stage_status}' "
-                f"mode=headless started={time.strftime('%Y-%m-%dT%H:%M:%S')} ===\n".encode()
-            )
-            logf.flush()
-            proc = await asyncio.create_subprocess_exec(
-                *cmd, stdout=logf, stderr=asyncio.subprocess.STDOUT
-            )
-            try:
-                if timeout_seconds:
-                    rc = await asyncio.wait_for(proc.wait(), timeout=timeout_seconds)
-                else:
-                    rc = await proc.wait()
-            except asyncio.TimeoutError:
-                proc.kill()
-                await proc.wait()
-                rc = -1
-                _log(f"run {run_id} timed out after {timeout_seconds}s — killed")
+    cmd = [
+        CLAUDE_BIN,
+        "-p", f"{command} --ticket {ticket}",
+        "--allowedTools", allowed_tools,
+    ]
+    _log(f"headless spawn for #{ticket} → {log_path.name}")
+    logf = open(log_path, "wb")  # noqa: WPS515 — kept open by background task
+    logf.write(
+        f"=== run_id={run_id} ticket={ticket} stage='{stage_status}' "
+        f"mode=headless started={time.strftime('%Y-%m-%dT%H:%M:%S')} ===\n".encode()
+    )
+    logf.flush()
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdout=logf, stderr=asyncio.subprocess.STDOUT
+    )
+
+    async def _watch() -> None:
+        rc: int
+        try:
+            if timeout_seconds:
+                rc = await asyncio.wait_for(proc.wait(), timeout=timeout_seconds)
+            else:
+                rc = await proc.wait()
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            rc = -1
+            _spawn_errors[run_id] = "timeout"
+            _log(f"run {run_id} timed out after {timeout_seconds}s — killed")
+        else:
+            _log(f"run {run_id} exited rc={rc}")
+            if rc != 0:
+                _spawn_errors[run_id] = f"crash:rc={rc}"
+        finally:
             logf.write(f"\n=== exited rc={rc} ===\n".encode())
-        _log(f"run {run_id} exited rc={rc}")
+            logf.close()
+
+    asyncio.create_task(_watch())
     return run_id
 
 
-def setup_worktree(repo_local_path: str, ticket: int, branch_id: str = "", base: str = "origin/master") -> str:
+def _setup_worktree_sync(repo_local_path: str, ticket: int, branch_id: str = "", base: str = "origin/master") -> str:
     branch = f"juanocampovgr/{branch_id or ticket}"
     worktree_path = str(WORKTREES_DIR / str(ticket))
 
     _log(f"  setup_worktree: repo={repo_local_path} branch={branch} base={base} worktree={worktree_path}")
 
-    r = subprocess.run(
+    subprocess.run(
         ["git", "-C", repo_local_path, "worktree", "remove", "--force", worktree_path],
         capture_output=True, text=True, check=False,
     )
@@ -481,9 +477,9 @@ def setup_worktree(repo_local_path: str, ticket: int, branch_id: str = "", base:
     return worktree_path
 
 
-def cleanup_worktree(worktree_path: str, repo_local_path: str, ticket: int, branch_id: str = "") -> None:
+def _cleanup_worktree_sync(worktree_path: str, repo_local_path: str, ticket: int, branch_id: str = "") -> None:
     branch = f"juanocampovgr/{branch_id or ticket}"
-    r = subprocess.run(
+    subprocess.run(
         ["git", "-C", repo_local_path, "worktree", "remove", "--force", worktree_path],
         capture_output=True, text=True, check=False,
     )
@@ -493,6 +489,18 @@ def cleanup_worktree(worktree_path: str, repo_local_path: str, ticket: int, bran
         ["git", "-C", repo_local_path, "branch", "-D", branch],
         capture_output=True, text=True, check=False,
     )
+
+
+async def setup_worktree(repo_local_path: str, ticket: int, branch_id: str = "", base: str = "origin/master") -> str:
+    """Async wrapper — runs git operations in a thread so the event loop stays free."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _setup_worktree_sync, repo_local_path, ticket, branch_id, base)
+
+
+async def cleanup_worktree(worktree_path: str, repo_local_path: str, ticket: int, branch_id: str = "") -> None:
+    """Async wrapper — runs git operations in a thread so the event loop stays free."""
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, _cleanup_worktree_sync, worktree_path, repo_local_path, ticket, branch_id)
 
 
 def spawn_terminal(stage_status: str, command: str, allowed_tools: str, ticket: int,
@@ -596,6 +604,7 @@ async def _handle_interrupt(
     repo_full = item["repo_full"]
     labels = item.get("labels", [])
     last_fired = graph_state_values.get("last_fired_at")
+    last_run_id = graph_state_values.get("last_run_id", "")
     _resumed = False
 
     async def resume(payload: dict) -> None:
@@ -604,8 +613,15 @@ async def _handle_interrupt(
         _log(f"    #{ticket}: resumed graph with {payload}")
         _resumed = True
 
+    # Fast-path: headless subprocess crashed → skip marker poll, resume immediately
+    spawn_error = _spawn_errors.pop(last_run_id, None) if last_run_id else None
+
     # ── Plan marker ───────────────────────────────────────────────────────────
     if interrupt_value == "waiting_plan_marker":
+        if spawn_error:
+            _log(f"    #{ticket}: headless plan crashed ({spawn_error}) → error")
+            await resume({"outcome": "error"})
+            return _resumed
         done = await issue_has_marker(client, repo_full, ticket,
                                       AI_STAGES["AI Planning"]["done_marker"], last_fired)
         if done:
@@ -630,6 +646,10 @@ async def _handle_interrupt(
 
     # ── Impl marker (code-tickets or spike-tickets) ───────────────────────────
     elif interrupt_value == "waiting_impl_marker":
+        if spawn_error:
+            _log(f"    #{ticket}: headless impl crashed ({spawn_error}) → error")
+            await resume({"outcome": "error"})
+            return _resumed
         done = await issue_has_marker(client, repo_full, ticket,
                                       AI_STAGES["AI Implementation"]["done_marker"], last_fired)
         if done:
@@ -640,8 +660,28 @@ async def _handle_interrupt(
         if errored:
             await resume({"outcome": "error"})
 
+    # ── Quality check marker ──────────────────────────────────────────────────
+    elif interrupt_value == "waiting_quality_marker":
+        if spawn_error:
+            _log(f"    #{ticket}: terminal quality-check crashed ({spawn_error}) → error")
+            await resume({"outcome": "error"})
+            return _resumed
+        done = await issue_has_marker(client, repo_full, ticket,
+                                      AI_STAGES["AI Quality Check"]["done_marker"], last_fired)
+        if done:
+            await resume({"outcome": "done"})
+            return _resumed
+        errored = await issue_has_marker(client, repo_full, ticket,
+                                         AI_STAGES["AI Quality Check"]["error_marker"], last_fired)
+        if errored:
+            await resume({"outcome": "error"})
+
     # ── Self-review marker ────────────────────────────────────────────────────
     elif interrupt_value == "waiting_self_review_marker":
+        if spawn_error:
+            _log(f"    #{ticket}: headless self-review crashed ({spawn_error}) → error")
+            await resume({"outcome": "error"})
+            return _resumed
         done = await issue_has_marker(client, repo_full, ticket,
                                       AI_STAGES["Self Review"]["done_marker"], last_fired)
         if done:
@@ -706,6 +746,10 @@ async def _handle_interrupt(
             if ci["status"] == "done":
                 await resume({"outcome": "done"})
                 return _resumed
+            if ci["status"] == "abandoned":
+                _log(f"    #{ticket}: PR #{pr_number} closed without merge → needs_human")
+                await resume({"outcome": "needs_human"})
+                return _resumed
             if ci["status"] == "fail":
                 ci_fix_count = graph_state_values.get("ci_fix_count", 0)
                 if ci_fix_count >= 3:
@@ -717,6 +761,10 @@ async def _handle_interrupt(
 
     # ── CI fix marker ─────────────────────────────────────────────────────────
     elif interrupt_value == "waiting_fix_ci_marker":
+        if spawn_error:
+            _log(f"    #{ticket}: headless fix-ci crashed ({spawn_error}) → needs_human")
+            await resume({"outcome": "needs_human"})
+            return _resumed
         done = await issue_has_marker(client, repo_full, ticket,
                                       AI_STAGES["AI-PR Assistance (CI Fix)"]["done_marker"],
                                       last_fired)
@@ -735,6 +783,10 @@ async def _handle_interrupt(
 
     # ── Review response marker ────────────────────────────────────────────────
     elif interrupt_value == "waiting_respond_marker":
+        if spawn_error:
+            _log(f"    #{ticket}: headless respond-to-review crashed ({spawn_error}) → needs_human")
+            await resume({"outcome": "needs_human"})
+            return _resumed
         done = await issue_has_marker(client, repo_full, ticket,
                                       AI_STAGES["AI-PR Assistance (Review)"]["done_marker"],
                                       last_fired)
@@ -814,6 +866,35 @@ def _sync_legacy_state(
             ts.last_acted_status = INTERRUPT_TO_STAGE.get(interrupt_val or "")
 
 
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _build_initial_state(
+    item: dict,
+    ticket: int,
+    jira_ticket_id: str | None,
+    *,
+    entry_point: str = "plan",
+) -> dict[str, Any]:
+    """Build the initial LangGraph state dict for a new graph thread."""
+    state: dict[str, Any] = {
+        "ticket_number":          ticket,
+        "item_id":                item["item_id"],
+        "issue_node_id":          item["issue_node_id"],
+        "repo":                   item["repo"],
+        "repo_full":              item["repo_full"],
+        "labels":                 item.get("labels", []),
+        "is_spike":               _is_spike(item),
+        "errors":                 [],
+        "ci_fix_count":           0,
+        "review_comment_round":   0,
+        "self_review_retry_count": 0,
+        "jira_ticket_id":         jira_ticket_id or "",
+    }
+    if entry_point != "plan":
+        state["entry_point"] = entry_point
+    return state
+
+
 # ── Main reconciliation loop ──────────────────────────────────────────────────
 
 async def reconcile_once(
@@ -867,20 +948,7 @@ async def reconcile_once(
                         _log(f"    #{ticket}: branch id '{jira_ticket_id}'")
 
                     _log(f"    #{ticket}: 'Ready To Pick Up' → starting new graph thread")
-                    initial: dict[str, Any] = {
-                        "ticket_number":   ticket,
-                        "item_id":         item["item_id"],
-                        "issue_node_id":   item["issue_node_id"],
-                        "repo":            item["repo"],
-                        "repo_full":       item["repo_full"],
-                        "labels":          item.get("labels", []),
-                        "is_spike":        _is_spike(item),
-                        "errors":          [],
-                        "ci_fix_count":    0,
-                        "review_comment_round": 0,
-                        "self_review_retry_count": 0,
-                        "jira_ticket_id":  jira_ticket_id or "",
-                    }
+                    initial = _build_initial_state(item, ticket, jira_ticket_id)
                     try:
                         await workflow.ainvoke(initial, config)
                         if ticket in legacy_state:
@@ -912,21 +980,7 @@ async def reconcile_once(
                         jira_ticket_id = make_branch_id(jira_ticket_id, item.get("title", ""))
                         _log(f"    #{ticket}: branch id '{jira_ticket_id}'")
 
-                    initial: dict[str, Any] = {
-                        "ticket_number":   ticket,
-                        "item_id":         item["item_id"],
-                        "issue_node_id":   item["issue_node_id"],
-                        "repo":            item["repo"],
-                        "repo_full":       item["repo_full"],
-                        "labels":          item.get("labels", []),
-                        "is_spike":        _is_spike(item),
-                        "errors":          [],
-                        "ci_fix_count":    0,
-                        "review_comment_round": 0,
-                        "self_review_retry_count": 0,
-                        "jira_ticket_id":  jira_ticket_id or "",
-                        "entry_point":     "implement",
-                    }
+                    initial = _build_initial_state(item, ticket, jira_ticket_id, entry_point="implement")
                     try:
                         await workflow.ainvoke(initial, config)
                         await _gql_remove_label(client, item["issue_node_id"], item["repo_full"], "plan-approved")

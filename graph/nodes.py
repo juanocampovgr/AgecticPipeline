@@ -146,12 +146,18 @@ async def node_spawn_implement(state: TicketState) -> dict:
             "_impl_marker_outcome": "error",
         }
 
+    async with httpx.AsyncClient(timeout=30) as client:
+        await _move_status(
+            client, state["item_id"], "AI Implementation",
+            **_cfg(), status_map=_status_map(),
+        )
+
     kill_existing_claude_for_ticket(ticket)
     branch_id = state.get("jira_ticket_id", "")
     from pipeline_poller import _get_repo_semaphore  # noqa: PLC0415
     try:
         async with _get_repo_semaphore(state["repo"]):
-            worktree_path = setup_worktree(repo_local, ticket, branch_id)
+            worktree_path = await setup_worktree(repo_local, ticket, branch_id)
     except Exception as e:
         err = f"Worktree setup failed: {e}"
         _log(f"  #{ticket}: ERROR: {err}")
@@ -177,6 +183,35 @@ async def node_wait_impl_marker(state: TicketState) -> dict:
     return {"_impl_marker_outcome": result.get("outcome", "done")}
 
 
+# ── Quality check stage (non-spike only) ─────────────────────────────────────
+
+async def node_spawn_quality_check(state: TicketState) -> dict:
+    from pipeline_poller import spawn_terminal, AI_STAGES  # noqa: PLC0415
+    ticket = state["ticket_number"]
+    worktree_path = state.get("worktree_path", "")
+
+    if not worktree_path:
+        err = "No worktree path in state for quality check"
+        _log(f"  #{ticket}: ERROR: {err}")
+        return {
+            "errors": (state.get("errors") or []) + [err],
+            "_quality_check_outcome": "error",
+        }
+
+    cfg = AI_STAGES["AI Quality Check"]
+    fired_at = time.time() - 5
+    _log(f"  #{ticket}: spawning quality check (terminal)")
+    run_id = spawn_terminal(
+        "AI Quality Check", cfg["command"], cfg["tools"], ticket, worktree_path,
+    )
+    return {"last_run_id": run_id, "last_fired_at": fired_at}
+
+
+async def node_wait_quality_check(state: TicketState) -> dict:
+    result = interrupt("waiting_quality_marker")
+    return {"_quality_check_outcome": result.get("outcome", "done")}
+
+
 # ── Self-review stage ─────────────────────────────────────────────────────────
 
 async def node_spawn_self_review(state: TicketState) -> dict:
@@ -197,13 +232,17 @@ async def node_wait_self_review_marker(state: TicketState) -> dict:
     outcome = result.get("outcome", "done")
     passed = outcome == "done"
     retry_count = state.get("self_review_retry_count", 0)
-    if not passed:
-        retry_count += 1
-    return {
+    new_retry_count = retry_count if passed else retry_count + 1
+    updates: dict = {
         "_self_review_outcome": outcome,
         "self_review_passed": passed,
-        "self_review_retry_count": retry_count,
+        "self_review_retry_count": new_retry_count,
     }
+    if not passed and new_retry_count >= 2:
+        updates["errors"] = (state.get("errors") or []) + [
+            f"Self-review failed after {new_retry_count} attempt(s) — escalating to Error."
+        ]
+    return updates
 
 
 async def node_move_to_impl_review(state: TicketState) -> dict:
@@ -213,7 +252,7 @@ async def node_move_to_impl_review(state: TicketState) -> dict:
         from pipeline_poller import cleanup_worktree  # noqa: PLC0415
         _log(f"  #{ticket}: cleaning worktree before impl review")
         branch_id = state.get("jira_ticket_id", "")
-        cleanup_worktree(state["worktree_path"], state["repo_local_path"], ticket, branch_id)
+        await cleanup_worktree(state["worktree_path"], state["repo_local_path"], ticket, branch_id)
 
     async with httpx.AsyncClient(timeout=30) as client:
         await _move_status(
@@ -261,7 +300,7 @@ async def node_spawn_ship(state: TicketState) -> dict:
     branch_id = state.get("jira_ticket_id", "")
     try:
         async with _get_repo_semaphore(state["repo"]):
-            worktree_path = setup_worktree(repo_local, ticket, branch_id)
+            worktree_path = await setup_worktree(repo_local, ticket, branch_id)
     except Exception as e:
         err = f"Ship worktree setup failed: {e}"
         _log(f"  #{ticket}: ERROR: {err}")
@@ -300,7 +339,7 @@ async def node_move_to_in_pr(state: TicketState) -> dict:
         from pipeline_poller import cleanup_worktree  # noqa: PLC0415
         _log(f"  #{ticket}: cleaning ship worktree before In PR")
         branch_id = state.get("jira_ticket_id", "")
-        cleanup_worktree(state["worktree_path"], state["repo_local_path"], ticket, branch_id)
+        await cleanup_worktree(state["worktree_path"], state["repo_local_path"], ticket, branch_id)
     async with httpx.AsyncClient(timeout=30) as client:
         await _move_status(
             client, state["item_id"], "In PR",
@@ -348,7 +387,7 @@ async def node_spawn_fix_ci(state: TicketState) -> dict:
     base = f"origin/juanocampovgr/{branch_id}" if branch_id else f"origin/juanocampovgr/{ticket}"
     try:
         async with _get_repo_semaphore(state["repo"]):
-            worktree_path = setup_worktree(repo_local, ticket, branch_id, base=base)
+            worktree_path = await setup_worktree(repo_local, ticket, branch_id, base=base)
     except Exception as e:
         err = f"Fix-CI worktree setup failed: {e}"
         _log(f"  #{ticket}: ERROR: {err}")
@@ -413,7 +452,7 @@ async def node_spawn_respond_to_review(state: TicketState) -> dict:
     base = f"origin/juanocampovgr/{branch_id}" if branch_id else f"origin/juanocampovgr/{ticket}"
     try:
         async with _get_repo_semaphore(state["repo"]):
-            worktree_path = setup_worktree(repo_local, ticket, branch_id, base=base)
+            worktree_path = await setup_worktree(repo_local, ticket, branch_id, base=base)
     except Exception as e:
         err = f"Respond-to-review worktree setup failed: {e}"
         _log(f"  #{ticket}: ERROR: {err}")
@@ -545,7 +584,14 @@ def route_impl_marker(state: TicketState) -> str:
         return "error"
     if state.get("is_spike"):
         return "spike_done"
-    return "self_review"
+    return "quality_check"
+
+
+def route_quality_check(state: TicketState) -> str:
+    outcome = state.get("_quality_check_outcome", "done")
+    if outcome == "error":
+        return "error"
+    return "proceed"
 
 
 def route_self_review(state: TicketState) -> str:
@@ -553,9 +599,9 @@ def route_self_review(state: TicketState) -> str:
     if outcome == "done":
         return "proceed"
     retry_count = state.get("self_review_retry_count", 0)
-    if retry_count < 2:
-        return "retry"
-    return "proceed"
+    if retry_count >= 2:
+        return "escalate"
+    return "retry"
 
 
 def route_impl_approval(state: TicketState) -> str:

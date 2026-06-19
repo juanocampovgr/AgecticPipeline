@@ -11,14 +11,22 @@ import httpx
 
 # ── Auth ─────────────────────────────────────────────────────────────────────
 
+_token_cache: str | None = None
+
+
 def _get_token() -> str:
+    global _token_cache
+    if _token_cache:
+        return _token_cache
     t = os.environ.get("GITHUB_TOKEN")
     if t:
-        return t
+        _token_cache = t
+        return _token_cache
     result = subprocess.run(["gh", "auth", "token"], capture_output=True, text=True)
     if result.returncode != 0 or not result.stdout.strip():
         raise RuntimeError("No GITHUB_TOKEN set and `gh auth token` failed — run `gh auth login`")
-    return result.stdout.strip()
+    _token_cache = result.stdout.strip()
+    return _token_cache
 
 
 def _log(msg: str) -> None:
@@ -394,8 +402,10 @@ async def fetch_ci_status(
     pr_state = pr_data["state"]
     merged = pr_data.get("merged", False)
 
-    if pr_state == "closed" or merged:
-        return {"status": "done", "failed_runs": [], "merged": merged}
+    if merged:
+        return {"status": "done", "failed_runs": [], "merged": True}
+    if pr_state == "closed":
+        return {"status": "abandoned", "failed_runs": [], "merged": False}
 
     # Get check runs for the head commit
     resp = await client.get(
