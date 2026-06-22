@@ -312,10 +312,15 @@ async def node_spawn_ship(state: TicketState) -> dict:
             **_cfg(), status_map=_status_map(),
         )
 
+    labels_lower = [l.lower() for l in state.get("labels", [])] if state.get("labels") else []
+    use_local = "ship-mode:local" in labels_lower
+    command = cfg["command_local"] if use_local else cfg["command"]
+    mode_label = "local" if use_local else "runner"
+
     fired_at = time.time() - 5
-    _log(f"  #{ticket}: spawning ship (terminal)")
+    _log(f"  #{ticket}: spawning ship (terminal, mode={mode_label})")
     run_id = spawn_terminal(
-        "Ready To Ship - AI", cfg["command"], cfg["tools"], ticket, worktree_path,
+        "Ready To Ship - AI", command, cfg["tools"], ticket, worktree_path,
     )
     return {
         "last_run_id": run_id,

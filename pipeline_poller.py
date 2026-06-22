@@ -74,7 +74,7 @@ STALE_THRESHOLD = {
     "AI Planning":         int(os.environ.get("STALE_PLAN_SECONDS",    "900")),
     "AI Implementation":   int(os.environ.get("STALE_IMPL_SECONDS",    "3600")),
     "AI Quality Check":    int(os.environ.get("STALE_QUALITY_SECONDS", "1800")),
-    "Ready To Ship - AI":  int(os.environ.get("STALE_SHIP_SECONDS",    "1800")),
+    "Ready To Ship - AI":  int(os.environ.get("STALE_SHIP_SECONDS",    "3600")),
 }
 
 MIN_DESCRIPTION_CHARS = int(os.environ.get("MIN_DESCRIPTION_CHARS", "20"))
@@ -189,12 +189,13 @@ AI_STAGES = {
         "spawn_mode":   "terminal",
     },
     "Ready To Ship - AI": {
-        "command":      "/ship-tickets",
-        "tools":        "Bash,Read,Grep,Glob,Edit,Write,Agent",
-        "done_marker":  "<!-- ai-ship:done -->",
-        "error_marker": "<!-- ai-ship:error -->",
-        "next_status":  "In PR",
-        "spawn_mode":   "headless",
+        "command":        "/ship-tickets-with-runner",
+        "command_local":  "/ship-tickets",
+        "tools":          "Bash,Read,Grep,Glob,Edit,Write,Agent",
+        "done_marker":    "<!-- ai-ship:done -->",
+        "error_marker":   "<!-- ai-ship:error -->",
+        "next_status":    "In PR",
+        "spawn_mode":     "headless",
     },
     "Self Review": {
         "command":      "/self-review-ticket",
@@ -1029,9 +1030,22 @@ async def reconcile_once(
                     ts_entry = legacy_state[ticket]
                     ts_entry.consecutive_failures += 1
                     if ts_entry.consecutive_failures >= MAX_TICKET_FAILURES:
-                        await _escalate_to_error(client, item,
+                        err_msg = (
                             f"Pipeline failed {ts_entry.consecutive_failures} consecutive times at "
-                            f"interrupt '{interrupt_value}'. Last error: {e}")
+                            f"interrupt '{interrupt_value}'. Last error: {e}"
+                        )
+                        # Resume graph cleanly so thread terminates; fall back to direct escalation.
+                        try:
+                            from langgraph.types import Command  # noqa: PLC0415
+                            await workflow.ainvoke(
+                                Command(resume={"outcome": "error"},
+                                        update={"errors": (gv.get("errors") or []) + [err_msg]}),
+                                config,
+                            )
+                            _log(f"    #{ticket}: graph terminated via resume(error) after repeated failures")
+                        except Exception as term_err:
+                            _log(f"    #{ticket}: graph termination failed ({term_err}) — falling back to direct escalation")
+                            await _escalate_to_error(client, item, err_msg)
                         ts_entry.consecutive_failures = 0
 
             if resumed:
@@ -1042,11 +1056,31 @@ async def reconcile_once(
             threshold = STALE_THRESHOLD.get(stage) if stage else None
             fired = gv.get("last_fired_at")
             if threshold and fired and (time.time() - fired) > threshold:
-                _log(f"    #{ticket}: stale spawn at '{stage}' — escalating to Error")
-                kill_existing_claude_for_ticket(ticket)
-                await _escalate_to_error(client, item,
-                    f"No result appeared within {threshold // 60} min while waiting at "
-                    f"'{stage}'. The spawned Claude session likely died or stalled.")
+                # Guard: if already in Error, skip — prevents re-escalation loop when user
+                # hasn't moved the ticket yet and the poller keeps seeing the stale timestamp.
+                if item.get("status") == "Error":
+                    _log(f"    #{ticket}: stale at '{stage}' but already in Error — skipping")
+                else:
+                    _log(f"    #{ticket}: stale spawn at '{stage}' — terminating graph thread")
+                    kill_existing_claude_for_ticket(ticket)
+                    stale_msg = (
+                        f"No result appeared within {threshold // 60} min while waiting at "
+                        f"'{stage}'. The spawned Claude session likely died or stalled."
+                    )
+                    # Resume the graph with outcome=error so it routes cleanly to
+                    # escalate_error → END, terminating the thread. This allows the
+                    # recovery path to activate on the next poll if the user retries.
+                    try:
+                        from langgraph.types import Command  # noqa: PLC0415
+                        await workflow.ainvoke(
+                            Command(resume={"outcome": "error"},
+                                    update={"errors": (gv.get("errors") or []) + [stale_msg]}),
+                            config,
+                        )
+                        _log(f"    #{ticket}: graph terminated via resume(error)")
+                    except Exception as term_err:
+                        _log(f"    #{ticket}: graph termination failed ({term_err}) — falling back to direct escalation")
+                        await _escalate_to_error(client, item, stale_msg)
 
         # Sync legacy state for backward compat with agentic_dev_pipe
         try:
