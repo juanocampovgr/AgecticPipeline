@@ -293,7 +293,35 @@ If the marker is **missing**:
 This guard prevents tickets from getting stuck when a subagent posts partial work as
 separate comments and omits the terminal marker.
 
-### 3b: Post plan comment
+### 3b: Write Pipeline Result
+
+Before posting the plan comment, write the structured result file so the pipeline graph node
+reads the outcome without waiting for a GitHub comment:
+
+```bash
+if [ -n "$PIPELINE_RESULT_PATH" ]; then
+  mkdir -p "$(dirname "$PIPELINE_RESULT_PATH")"
+  # plan_content = full plan text, plan_comment_url = URL of the posted GitHub comment
+  cat > "$PIPELINE_RESULT_PATH" << RESULT_EOF
+{
+  "outcome": "done",
+  "plan_content": {PLAN_TEXT_JSON_ESCAPED},
+  "plan_comment_url": "{GITHUB_COMMENT_URL}"
+}
+RESULT_EOF
+fi
+```
+
+On error (before posting `<!-- ai-plan:error -->`):
+
+```bash
+if [ -n "$PIPELINE_RESULT_PATH" ]; then
+  mkdir -p "$(dirname "$PIPELINE_RESULT_PATH")"
+  printf '{"outcome":"error","error":"%s"}' "{ERROR_DESCRIPTION}" > "$PIPELINE_RESULT_PATH"
+fi
+```
+
+### 3c: Post plan comment
 
 If dry_run == true:
   Print the plan markdown to terminal.
@@ -340,3 +368,4 @@ Tickets:
 | gh 429 rate limit | Wait 60s, retry once. Then EXIT. |
 | Comment post fails | Log error. Continue. Poller will retry next cycle (marker absent). |
 | Zero tickets found | Print "Nothing to do." EXIT cleanly. |
+

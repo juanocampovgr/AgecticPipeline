@@ -1,160 +1,83 @@
-"""Unit tests for all LangGraph routing functions in graph/nodes.py.
+"""Routing logic tests for the LangGraph-native pipeline.
 
-No I/O, no subprocesses, no GitHub API calls — pure state → route-key assertions.
-Run with: python -m pytest tests/test_routing.py -v
+In the new architecture, routing is embedded inside each node function via
+Command(goto=...) — there are no standalone routing functions.  The routing
+paths are exercised implicitly through integration tests that run the full
+graph with an in-memory checkpointer.
+
+This file verifies that the runner's compute_result_path produces the correct
+deterministic paths, since that is the primary idempotency guard.
 """
 
-import pytest
-import sys, os
+import os
+import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from graph.nodes import (
-    route_entry,
-    route_plan_marker,
-    route_impl_marker,
-    route_self_review,
-    route_impl_approval,
-    route_ship_marker,
-    route_monitor_pr,
-    route_fix_ci,
-    route_respond,
-)
+os.environ.setdefault("PROJECT_NODE_ID", "test")
+os.environ.setdefault("STATUS_FIELD_ID", "test")
+os.environ.setdefault("PROJECT_OWNER", "test")
+os.environ.setdefault("PROJECT_NUMBER", "1")
+os.environ.setdefault("PIPELINE_RESULTS_DIR", "/tmp/pipeline_test_results")
+
+from graph.runner import compute_result_path
 
 
-# ── route_entry ───────────────────────────────────────────────────────────────
-
-def test_route_entry_normal():
-    assert route_entry({}) == "normal"
-    assert route_entry({"is_spike": False}) == "normal"
-    assert route_entry({"entry_point": "plan"}) == "normal"
-
-
-def test_route_entry_spike():
-    assert route_entry({"is_spike": True}) == "spike"
+def _state(ticket: int, *, retry: int = 0, ci_fix: int = 0, review_round: int = 0) -> dict:
+    return {
+        "identity": {"ticket_number": ticket},
+        "impl": {"self_review_retry_count": retry},
+        "ship": {"ci_fix_count": ci_fix},
+        "review": {"review_comment_round": review_round},
+        "run_history": [],
+    }
 
 
-def test_route_entry_implement():
-    assert route_entry({"entry_point": "implement"}) == "implement"
+# ── compute_result_path ───────────────────────────────────────────────────────
+
+def test_plan_result_path():
+    path = compute_result_path(_state(42), "AI Planning")
+    assert str(path).endswith("42/ai_planning_0.json")
 
 
-def test_route_entry_spike_beats_implement():
-    # spike flag takes priority in route_entry
-    assert route_entry({"is_spike": True, "entry_point": "implement"}) == "spike"
+def test_implement_result_path():
+    path = compute_result_path(_state(42), "AI Implementation")
+    assert str(path).endswith("42/ai_implementation_0.json")
 
 
-# ── route_plan_marker ─────────────────────────────────────────────────────────
-
-def test_route_plan_marker_done():
-    assert route_plan_marker({"_plan_marker_outcome": "done"}) == "done"
-
-
-def test_route_plan_marker_error():
-    assert route_plan_marker({"_plan_marker_outcome": "error"}) == "error"
+def test_quality_result_path():
+    path = compute_result_path(_state(42), "AI Quality Check")
+    assert str(path).endswith("42/ai_quality_check_0.json")
 
 
-def test_route_plan_marker_default():
-    assert route_plan_marker({}) == "done"
+def test_self_review_result_path_with_retry():
+    path = compute_result_path(_state(42, retry=2), "Self Review")
+    assert str(path).endswith("42/self_review_2.json")
 
 
-# ── route_impl_marker ─────────────────────────────────────────────────────────
-
-def test_route_impl_marker_non_spike_success():
-    assert route_impl_marker({"_impl_marker_outcome": "done", "is_spike": False}) == "self_review"
-
-
-def test_route_impl_marker_spike_done():
-    assert route_impl_marker({"_impl_marker_outcome": "done", "is_spike": True}) == "spike_done"
+def test_fix_ci_result_path_with_count():
+    path = compute_result_path(_state(42, ci_fix=1), "Fix CI")
+    assert str(path).endswith("42/fix_ci_1.json")
 
 
-def test_route_impl_marker_error():
-    assert route_impl_marker({"_impl_marker_outcome": "error"}) == "error"
-    assert route_impl_marker({"_impl_marker_outcome": "error", "is_spike": True}) == "error"
+def test_respond_result_path_with_round():
+    path = compute_result_path(_state(42, review_round=2), "Respond to Review")
+    assert str(path).endswith("42/respond_to_review_2.json")
 
 
-def test_route_impl_marker_default_non_spike():
-    assert route_impl_marker({}) == "self_review"
+def test_ship_result_path():
+    path = compute_result_path(_state(42), "Ship")
+    assert str(path).endswith("42/ship_0.json")
 
 
-# ── route_self_review ─────────────────────────────────────────────────────────
-
-def test_route_self_review_passed():
-    assert route_self_review({"_self_review_outcome": "done"}) == "proceed"
-    assert route_self_review({}) == "proceed"
-
-
-def test_route_self_review_retry_first():
-    assert route_self_review({"_self_review_outcome": "error", "self_review_retry_count": 1}) == "retry"
+def test_result_path_uses_ticket_number_as_directory():
+    path = compute_result_path(_state(99), "AI Planning")
+    parts = path.parts
+    assert "99" in parts, f"Expected ticket directory '99' in path parts: {parts}"
 
 
-def test_route_self_review_escalate_at_max():
-    assert route_self_review({"_self_review_outcome": "error", "self_review_retry_count": 2}) == "escalate"
-    assert route_self_review({"_self_review_outcome": "error", "self_review_retry_count": 5}) == "escalate"
-
-
-# ── route_impl_approval ───────────────────────────────────────────────────────
-
-def test_route_impl_approval_ship():
-    assert route_impl_approval({"impl_approval_type": "impl-approved", "is_spike": False}) == "ship"
-    assert route_impl_approval({}) == "ship"
-
-
-def test_route_impl_approval_spike_done():
-    assert route_impl_approval({"impl_approval_type": "impl-approved", "is_spike": True}) == "spike_done"
-
-
-def test_route_impl_approval_followups():
-    assert route_impl_approval({"impl_approval_type": "followup-approved", "is_spike": True}) == "followups"
-
-
-def test_route_impl_approval_followup_non_spike_goes_to_spike_done():
-    # followup-approved only makes sense for spike; non-spike falls through to spike_done
-    assert route_impl_approval({"impl_approval_type": "followup-approved", "is_spike": False}) == "ship"
-
-
-# ── route_ship_marker ─────────────────────────────────────────────────────────
-
-def test_route_ship_marker():
-    assert route_ship_marker({"_ship_marker_outcome": "done"}) == "done"
-    assert route_ship_marker({"_ship_marker_outcome": "error"}) == "error"
-    assert route_ship_marker({"_ship_marker_outcome": "retry"}) == "retry"
-    assert route_ship_marker({}) == "done"
-
-
-# ── route_monitor_pr ──────────────────────────────────────────────────────────
-
-def test_route_monitor_pr():
-    assert route_monitor_pr({"pr_outcome": "done"}) == "done"
-    assert route_monitor_pr({"pr_outcome": "fix_ci"}) == "fix_ci"
-    assert route_monitor_pr({"pr_outcome": "respond"}) == "respond"
-    assert route_monitor_pr({"pr_outcome": "needs_human"}) == "needs_human"
-    assert route_monitor_pr({}) == "done"
-
-
-# ── route_fix_ci ──────────────────────────────────────────────────────────────
-
-def test_route_fix_ci_continue():
-    assert route_fix_ci({"_fix_ci_outcome": "done", "ci_fix_count": 1}) == "monitor_pr"
-
-
-def test_route_fix_ci_needs_human_direct():
-    assert route_fix_ci({"_fix_ci_outcome": "needs_human"}) == "needs_human"
-
-
-def test_route_fix_ci_needs_human_at_limit():
-    assert route_fix_ci({"_fix_ci_outcome": "done", "ci_fix_count": 3}) == "needs_human"
-    assert route_fix_ci({"_fix_ci_outcome": "done", "ci_fix_count": 4}) == "needs_human"
-
-
-# ── route_respond ─────────────────────────────────────────────────────────────
-
-def test_route_respond_continue():
-    assert route_respond({"_respond_outcome": "done", "review_comment_round": 1}) == "monitor_pr"
-
-
-def test_route_respond_needs_human_direct():
-    assert route_respond({"_respond_outcome": "needs_human"}) == "needs_human"
-
-
-def test_route_respond_needs_human_at_limit():
-    assert route_respond({"_respond_outcome": "done", "review_comment_round": 2}) == "needs_human"
-    assert route_respond({"_respond_outcome": "done", "review_comment_round": 5}) == "needs_human"
+def test_result_path_is_deterministic():
+    """Same state + same stage must always produce the same path."""
+    state = _state(7, retry=1)
+    p1 = compute_result_path(state, "AI Self Review")
+    p2 = compute_result_path(state, "AI Self Review")
+    assert p1 == p2

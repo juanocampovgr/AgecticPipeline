@@ -50,7 +50,26 @@ Implement requested changes from unresolved PR review comments. For each comment
    ```
    Only reply on threads where you made a change. Do NOT reply on threads you skipped.
 
-8. **Post completion marker** on the issue:
+8. **Write Pipeline Result** — before posting the marker comment, write the result file so the
+   pipeline graph node reads the outcome without waiting for a GitHub comment:
+
+   On success (implemented at least one comment):
+   ```bash
+   if [ -n "$PIPELINE_RESULT_PATH" ]; then
+     mkdir -p "$(dirname "$PIPELINE_RESULT_PATH")"
+     echo '{"outcome":"done","responded_thread_ids":[]}' > "$PIPELINE_RESULT_PATH"
+   fi
+   ```
+
+   If no implementable comments were found:
+   ```bash
+   if [ -n "$PIPELINE_RESULT_PATH" ]; then
+     mkdir -p "$(dirname "$PIPELINE_RESULT_PATH")"
+     printf '{"outcome":"needs_human","error":"%s"}' "<REASON>" > "$PIPELINE_RESULT_PATH"
+   fi
+   ```
+
+9. **Post completion marker** on the issue:
    ```
    ✅ **Review comments addressed**
 

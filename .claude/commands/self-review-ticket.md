@@ -36,7 +36,27 @@ Review your own implementation of a GitHub ticket before sending it for human re
    - If all checklist items pass AND code review has no blocking issues → **passed**
    - If any critical item fails → **failed** (will trigger a re-implementation)
 
-7. **Post result comment** on the GitHub issue:
+7. **Write Pipeline Result** — before posting the marker comment, write the result file so the
+   pipeline graph node reads the outcome without waiting for a GitHub comment:
+
+   On pass (no blocking issues found):
+   ```bash
+   if [ -n "$PIPELINE_RESULT_PATH" ]; then
+     mkdir -p "$(dirname "$PIPELINE_RESULT_PATH")"
+     echo '{"outcome":"done","self_review_passed":true}' > "$PIPELINE_RESULT_PATH"
+   fi
+   ```
+
+   On fail (blocking issues found):
+   ```bash
+   if [ -n "$PIPELINE_RESULT_PATH" ]; then
+     mkdir -p "$(dirname "$PIPELINE_RESULT_PATH")"
+     printf '{"outcome":"error","self_review_passed":false,"error":"%s"}' \
+       "Self-review found blocking issues requiring re-implementation" > "$PIPELINE_RESULT_PATH"
+   fi
+   ```
+
+8. **Post result comment** on the GitHub issue:
 
    On pass:
    ```

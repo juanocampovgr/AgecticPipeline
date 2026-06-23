@@ -1,10 +1,15 @@
 # quality-check
 
-Runs quality checks scoped to only the modules changed by the implementation branch.
+Runs verification checks scoped to only the modules changed by the implementation branch.
 The poller has already committed and pushed the implementation; this skill runs in the same worktree.
 
+Two modes:
+- `--mode runner` **(default)**: dispatch GitHub Actions workflows and watch results. Matches CI exactly; robust to local environment issues.
+- `--mode local`: run `./gradlew` locally. Faster (~2–5 min) but requires a healthy local env (credentials, Gradle daemon, etc.).
+
 On success (all checks pass, with or without auto-fixes): post `<!-- ai-quality:done -->`.
-On unrecoverable failure: post `<!-- ai-quality:error -->` — the poller detects this and moves the ticket to **Error**.
+On unrecoverable code failure: post `<!-- ai-quality:error -->` — graph routes to `escalate_error`.
+On infrastructure failure (credentials, network, Gradle daemon): write `outcome: "needs_human"` — graph routes to `needs_human` for human recovery.
 
 **NEVER create a PR. NEVER change ticket status. NEVER run `git checkout` or `git branch`.**
 
@@ -12,7 +17,7 @@ On unrecoverable failure: post `<!-- ai-quality:error -->` — the poller detect
 
 ## ERROR REPORTING PROCEDURE
 
-Call this on **every** unrecoverable failure before EXIT:
+Call this on **every** unrecoverable code failure before EXIT:
 
 ```bash
 gh issue comment {ISSUE_NUMBER} \
@@ -25,6 +30,26 @@ gh issue comment {ISSUE_NUMBER} \
 The ticket has been moved to **Error** for human review. Fix the issue and move it back to **AI Implementation** to retry.
 
 <!-- ai-quality:error -->"
+```
+
+## INFRASTRUCTURE FAILURE PROCEDURE
+
+Call this when the failure is environmental (expired credentials, network timeout, Gradle daemon OOM, missing tool):
+
+```bash
+if [ -n "$PIPELINE_RESULT_PATH" ]; then
+  mkdir -p "$(dirname "$PIPELINE_RESULT_PATH")"
+  printf '{"outcome":"needs_human","error":"%s"}' "{INFRA_ERROR_DESCRIPTION}" > "$PIPELINE_RESULT_PATH"
+fi
+gh issue comment {ISSUE_NUMBER} \
+  --repo {ISSUE_REPO_FULL} \
+  --body "⚠️ **Quality check paused — infrastructure issue**
+
+**Error:** {INFRA_ERROR_DESCRIPTION}
+
+**To retry:** Fix the underlying issue (e.g. refresh AWS CodeArtifact credentials), then use \`python pipeline_poller.py reset-thread {ISSUE_NUMBER}\` to restart. Alternatively, add the \`quality-mode:runner\` label (or remove \`quality-mode:local\`) to switch to GitHub Actions runners.
+
+<!-- ai-quality:needs-human -->"
 ```
 
 ---
@@ -46,6 +71,7 @@ Derive GitHub org/owner from git remotes:
 
 Parse `$ARGUMENTS`:
 - `--ticket <N>` → required; identifies the GitHub issue
+- `--mode local|runner` → optional; defaults to `runner`
 - `--dry-run`    → print detected modules and planned checks, skip execution, post nothing
 
 ---
@@ -103,11 +129,26 @@ Deduplicate the resulting list. Store as `affected_modules`.
 
 If `affected_modules` is empty after processing: post `<!-- ai-quality:done -->` immediately and EXIT.
 
-If `--dry-run`: print the detected modules and what checks would run, then EXIT.
+If `--dry-run`: print the detected modules, the mode, and what checks would run, then EXIT.
 
 ---
 
-## PHASE 3 — Scoped quality checks
+## PHASE 3 — Push branch (required before runner mode; safe for local too)
+
+```bash
+BRANCH=$(git rev-parse --abbrev-ref HEAD)
+git push -u origin HEAD
+```
+
+If push fails:
+- For `--mode runner`: this is fatal — run INFRASTRUCTURE FAILURE PROCEDURE and EXIT (runners need the remote ref).
+- For `--mode local`: log warning and continue (checks run locally on working tree).
+
+---
+
+## PHASE 4 — Verify
+
+### Mode: `--mode local`
 
 Build per-check Gradle task lists from `affected_modules`:
 - Detekt tasks:  `{module}:detekt` for each module
@@ -116,7 +157,7 @@ Build per-check Gradle task lists from `affected_modules`:
 
 Launch **3 parallel subagents** — one per check type. Each gets up to **3 auto-fix attempts**.
 
-### Subagent A — detekt
+**Subagent A — detekt**
 ```bash
 ./gradlew {module1:detekt} {module2:detekt} ... 2>&1
 ```
@@ -126,65 +167,144 @@ Repeat up to 3 times:
 3. If it passes, stop and return success
 
 After 3 failed attempts:
-- Return `{ "check": "detekt", "passed": false, "fixes_applied": true, "error": "<summary>" }`
+- If the error is a Gradle/toolchain infrastructure issue (OOM, credentials, missing plugin) → return infra failure signal
+- Otherwise → return `{ "check": "detekt", "passed": false, "fixes_applied": true, "error": "<summary>" }`
 
-On success at any attempt:
+On success:
 - Return `{ "check": "detekt", "passed": true, "fixes_applied": true/false }`
 
-### Subagent B — lint
-```bash
-./gradlew {module1:lint} {module2:lint} ... 2>&1
-```
-Same retry logic as detekt (up to 3 fix attempts).
-Return `{ "check": "lint", "passed": true/false, "fixes_applied": true/false, "error": "<summary if failed>" }`.
+**Subagent B — lint** — same retry logic as detekt (up to 3 fix attempts).
 
-### Subagent C — unit tests
-```bash
-./gradlew {module1:testDebugUnitTest} {module2:testDebugUnitTest} ... 2>&1
-```
-Repeat up to 3 times:
-1. If tests fail, read the output and attempt to fix failing test code via Edit tool
-2. Re-run the command
-3. If it passes, stop and return success
+**Subagent C — unit tests** — same retry logic (up to 3 fix attempts).
 
-After 3 failed attempts:
-- Return `{ "check": "unit_tests", "passed": false, "fixes_applied": true, "error": "<summary>" }`
-
-On success at any attempt:
-- Return `{ "check": "unit_tests", "passed": true, "fixes_applied": true/false }`
+If **any subagent signals an infrastructure failure**, run the INFRASTRUCTURE FAILURE PROCEDURE and EXIT.
 
 ---
 
-**After collecting all three subagent results: ALWAYS continue to Phase 4 and Phase 5, regardless of whether any check passed or failed. Do NOT exit here. The marker must always be posted.**
+### Mode: `--mode runner` (default)
+
+**Step 1 — Dispatch workflows:**
+```bash
+gh workflow run detekt.yml       --ref "$BRANCH" --repo Grindr/grindr-android
+gh workflow run android-lint.yml --ref "$BRANCH" --repo Grindr/grindr-android
+gh workflow run unit-tests.yml   --ref "$BRANCH" --repo Grindr/grindr-android
+```
+
+If any dispatch fails with a non-auth error (network, quota): run INFRASTRUCTURE FAILURE PROCEDURE and EXIT.
+If any dispatch fails with a 401/403: print `gh auth refresh -s repo`. EXIT.
+
+**Step 2 — Resolve run IDs** (wait 5s for GitHub to register):
+```bash
+sleep 5
+DETEKT_ID=$(gh run list --workflow detekt.yml       --branch "$BRANCH" --repo Grindr/grindr-android --limit 1 --json databaseId --jq '.[0].databaseId')
+LINT_ID=$(gh run list   --workflow android-lint.yml --branch "$BRANCH" --repo Grindr/grindr-android --limit 1 --json databaseId --jq '.[0].databaseId')
+TESTS_ID=$(gh run list  --workflow unit-tests.yml   --branch "$BRANCH" --repo Grindr/grindr-android --limit 1 --json databaseId --jq '.[0].databaseId')
+```
+
+**Step 3 — Watch all three in parallel:**
+```bash
+gh run watch "$DETEKT_ID" --exit-status --repo Grindr/grindr-android &
+PID_DETEKT=$!
+gh run watch "$LINT_ID"   --exit-status --repo Grindr/grindr-android &
+PID_LINT=$!
+gh run watch "$TESTS_ID"  --exit-status --repo Grindr/grindr-android &
+PID_TESTS=$!
+
+wait $PID_DETEKT; RC_DETEKT=$?
+wait $PID_LINT;   RC_LINT=$?
+wait $PID_TESTS;  RC_TESTS=$?
+```
+
+**Step 4 — Handle failures** (up to 2 fix attempts per failing check):
+
+For each run that failed (non-zero exit):
+1. Download the failure log:
+   ```bash
+   gh run view <FAILED_ID> --log-failed --repo Grindr/grindr-android
+   ```
+2. Read and understand the failure.
+   - If the failure is a tool/environment issue (missing secret, runner quota exceeded, network timeout): run INFRASTRUCTURE FAILURE PROCEDURE and EXIT.
+   - Otherwise: apply auto-fixes via Edit tool.
+3. Commit and push the fix:
+   ```bash
+   git add -A
+   git commit -m "fix: quality-check auto-fix for #{ISSUE_NUMBER} ({check_name})"
+   git push
+   ```
+4. Re-dispatch only the failing workflow and resolve its new run ID (same as Steps 1–2, for that single workflow).
+5. Watch the re-dispatched run. If it passes, mark that check as resolved.
+
+If a check still fails after 2 fix attempts:
+- Return `{ "check": "<name>", "passed": false, "fixes_applied": true, "error": "<summary>" }`
 
 ---
 
-## PHASE 4 — Commit and push fixes (if any)
+**After collecting all check results: ALWAYS continue to Phase 5 and Phase 6, regardless of pass/fail. Do NOT exit here. The marker must always be posted.**
 
-Check if any subagent reported `fixes_applied: true`.
+---
 
-If fixes were applied:
+## PHASE 5 — Commit and push fixes (local mode only)
+
+If `--mode local` and any subagent reported `fixes_applied: true`:
 ```bash
 git add -A
-git commit -m "fix: quality check auto-fixes for #{ISSUE_NUMBER}"
-git push origin juanocampovgr/{ISSUE_NUMBER}
+git commit -m "fix: quality-check auto-fixes for #{ISSUE_NUMBER}"
+git push origin {BRANCH}
 ```
 
 On commit failure: run ERROR REPORTING PROCEDURE and EXIT.
 On push failure: run ERROR REPORTING PROCEDURE and EXIT.
 
+If `--mode runner`: fixes are already committed and pushed during Phase 4 retry loops; skip this phase.
+
 If no fixes were applied: skip this phase.
 
 ---
 
-## PHASE 5 — Post marker comment
+## PHASE 5b — Write Pipeline Result
+
+Before posting the marker, write the structured result file so the pipeline graph node reads the
+outcome without waiting for a GitHub comment:
+
+```bash
+if [ -n "$PIPELINE_RESULT_PATH" ]; then
+  mkdir -p "$(dirname "$PIPELINE_RESULT_PATH")"
+  cat > "$PIPELINE_RESULT_PATH" << RESULT_EOF
+{
+  "outcome": "done",
+  "quality_mode": "{MODE}",
+  "checks": [
+    {"check": "detekt",     "passed": true, "fixes_applied": false},
+    {"check": "lint",       "passed": true, "fixes_applied": false},
+    {"check": "unit_tests", "passed": true, "fixes_applied": false}
+  ],
+  "modules": {AFFECTED_MODULES_JSON_ARRAY}
+}
+RESULT_EOF
+fi
+```
+
+On any code check failure (before running the ERROR REPORTING PROCEDURE):
+```bash
+if [ -n "$PIPELINE_RESULT_PATH" ]; then
+  mkdir -p "$(dirname "$PIPELINE_RESULT_PATH")"
+  printf '{"outcome":"error","error":"%s"}' "{ERROR_DESCRIPTION}" > "$PIPELINE_RESULT_PATH"
+fi
+```
+
+On infrastructure failure: write `outcome: "needs_human"` via the INFRASTRUCTURE FAILURE PROCEDURE (already handled above — do not double-write).
+
+---
+
+## PHASE 6 — Post marker comment
 
 **If all checks passed:**
 
 Post to the issue:
 ```markdown
-**Quality checks passed**
+✅ **Quality checks passed**
 
+- **Mode:** {local|runner}
 - **Modules checked:** {module list}
 - **Checks:** detekt ✅  lint ✅  unit tests ✅
 - **Auto-fixes applied:** yes/no
@@ -204,12 +324,13 @@ gh issue comment {ISSUE_NUMBER} \
 
 ---
 
-## PHASE 6 — Summary
+## PHASE 7 — Summary
 
 Print:
 ```
 === quality-check Complete ===
   #{ISSUE_NUMBER} — "{TITLE}"
+  Mode: {local|runner}
   Modules checked: {module list}
   Checks: detekt ✅/❌  lint ✅/❌  unit tests ✅/❌
   Fixes applied: yes/no
@@ -226,10 +347,15 @@ Print:
 | `./gradlew` absent | Post done marker, EXIT |
 | No changed files | Post done marker, EXIT |
 | No modules detected | Post done marker, EXIT |
-| detekt fails after 3 attempts | Run error procedure (include detekt output), EXIT |
-| lint fails after 3 attempts | Run error procedure (include lint output), EXIT |
-| unit tests fail after 3 attempts | Run error procedure (include test failure summary), EXIT |
-| git commit fails (fixes) | Run error procedure, EXIT |
-| git push fails (fixes) | Run error procedure, EXIT |
+| Push fails (runner mode) | Run INFRASTRUCTURE FAILURE PROCEDURE, EXIT |
+| Workflow dispatch fails (network/quota) | Run INFRASTRUCTURE FAILURE PROCEDURE, EXIT |
+| Workflow dispatch fails (401/403) | Print `gh auth refresh -s repo`. EXIT. |
+| AWS CodeArtifact 401 (local) | Run INFRASTRUCTURE FAILURE PROCEDURE, EXIT |
+| Gradle daemon OOM (local) | Run INFRASTRUCTURE FAILURE PROCEDURE, EXIT |
+| detekt fails after 3 attempts (local) / 2 attempts (runner) | Run ERROR REPORTING PROCEDURE, EXIT |
+| lint fails after 3/2 attempts | Run ERROR REPORTING PROCEDURE, EXIT |
+| unit tests fail after 3/2 attempts | Run ERROR REPORTING PROCEDURE, EXIT |
+| git commit fails (fixes) | Run ERROR REPORTING PROCEDURE, EXIT |
+| git push fails (local fixes) | Run ERROR REPORTING PROCEDURE, EXIT |
 | Error comment post fails | Log and EXIT — poller staleness watchdog will flag it |
 | gh 401 auth error | Print `gh auth refresh -s repo`. EXIT. |

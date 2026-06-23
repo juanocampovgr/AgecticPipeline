@@ -186,6 +186,41 @@ compare_url = https://github.com/{ISSUE_REPO_FULL}/compare/master...juanocampovg
 
 ---
 
+## PHASE 4b — Write Pipeline Result
+
+Before posting the `<!-- ai-impl:done -->` marker, write a structured result file so the
+pipeline graph node can read the outcome without waiting for a GitHub comment:
+
+```bash
+if [ -n "$PIPELINE_RESULT_PATH" ]; then
+  mkdir -p "$(dirname "$PIPELINE_RESULT_PATH")"
+  # Replace placeholders with actual values
+  cat > "$PIPELINE_RESULT_PATH" << RESULT_EOF
+{
+  "outcome": "done",
+  "branch": "juanocampovgr/{ISSUE_NUMBER}",
+  "files_changed": {FILES_CHANGED_JSON_ARRAY},
+  "impl_summary": "Implementation complete for #{ISSUE_NUMBER}",
+  "commit_shas": {COMMIT_SHAS_JSON_ARRAY}
+}
+RESULT_EOF
+fi
+```
+
+On **any error path** (wherever you would post `<!-- ai-impl:error -->`), write first:
+
+```bash
+if [ -n "$PIPELINE_RESULT_PATH" ]; then
+  mkdir -p "$(dirname "$PIPELINE_RESULT_PATH")"
+  printf '{"outcome":"error","error":"%s"}' "{ERROR_DESCRIPTION}" > "$PIPELINE_RESULT_PATH"
+fi
+```
+
+`$PIPELINE_RESULT_PATH` is set by the pipeline runner. If the variable is unset the skill runs
+in standalone mode — the write is skipped and only the marker comment is used.
+
+---
+
 ## PHASE 5 — Post implementation marker comment
 
 Post to the issue with **exactly** this body (substitute values):
@@ -242,3 +277,4 @@ The poller detects the error marker on the next poll and moves the ticket to **E
 | git push fails | Run error procedure, EXIT |
 | Error comment post fails | Log and EXIT — poller staleness watchdog will flag it |
 | gh 401 auth error | Print `gh auth refresh -s repo`. EXIT. |
+

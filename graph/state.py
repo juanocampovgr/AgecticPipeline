@@ -1,60 +1,106 @@
 """LangGraph TicketState TypedDict — source of truth for all graph threads."""
 
-from typing import TypedDict
+from operator import add
+from typing import Annotated, Literal, TypedDict
 
+
+def merge_dict(old: dict | None, new: dict | None) -> dict:
+    """Shallow patch-merge for nested overwrite groups."""
+    return {**(old or {}), **(new or {})}
+
+
+# ── Overwrite-only groups ─────────────────────────────────────────────────────
+
+class Identity(TypedDict, total=False):
+    ticket_number: int
+    item_id: str
+    issue_node_id: str
+    repo: str
+    repo_full: str
+    repo_local_path: str
+    is_spike: bool
+    labels: list[str]
+    jira_ticket_id: str
+    entry_point: Literal["plan", "implement"]
+
+
+class RequestMemory(TypedDict, total=False):
+    initial_request: str
+    initial_request_url: str
+    approved_plan: str
+    approved_plan_comment_url: str
+    plan_revision: int
+
+
+class QualityResult(TypedDict, total=False):
+    check: Literal["detekt", "lint", "unit_tests"]
+    passed: bool
+    fixes_applied: bool
+    error: str
+
+
+class Implementation(TypedDict, total=False):
+    branch: str
+    worktree_path: str
+    files_changed: list[str]
+    impl_summary: str
+    self_review_passed: bool
+    self_review_retry_count: int
+
+
+class Quality(TypedDict, total=False):
+    checks: list[QualityResult]
+    affected_modules: list[str]
+    quality_mode: Literal["local", "runner"]
+
+
+class Ship(TypedDict, total=False):
+    pr_number: int
+    pr_url: str
+    ci_status: Literal["pass", "fail", "pending", "done", "unknown"]
+    ci_fix_count: int
+
+
+class Review(TypedDict, total=False):
+    review_comment_round: int
+    open_thread_ids: list[str]
+
+
+class Spike(TypedDict, total=False):
+    research_doc_url: str
+
+
+class RunRecord(TypedDict, total=False):
+    stage: str
+    run_id: str
+    started_at: float
+    finished_at: float
+    outcome: Literal["done", "error", "needs_human", "timeout", "crash"]
+    result_path: str
+
+
+class Control(TypedDict, total=False):
+    current_stage: str
+    last_run: RunRecord
+
+
+# ── Top-level TicketState ─────────────────────────────────────────────────────
 
 class TicketState(TypedDict, total=False):
-    # ── Identity (always set at thread start) ─────────────────────────────────
-    ticket_number: int
-    item_id: str            # ProjectV2Item node ID
-    issue_node_id: str      # Issue node ID (for label mutations)
-    repo: str               # short name, e.g. "grindr-android"
-    repo_full: str          # "owner/repo"
-    is_spike: bool
-    labels: list        # GitHub issue labels at thread-start time
-    jira_ticket_id: str     # Jira ID parsed from title/body, e.g. "ANDROID-1234"; empty if none
-    entry_point: str        # "plan" (default) | "implement" — alternate graph entry for recovery
+    # Nested overwrite groups (merge_dict reducer)
+    identity: Annotated[Identity, merge_dict]
+    request:  Annotated[RequestMemory, merge_dict]
+    impl:     Annotated[Implementation, merge_dict]
+    quality:  Annotated[Quality, merge_dict]
+    ship:     Annotated[Ship, merge_dict]
+    review:   Annotated[Review, merge_dict]
+    spike:    Annotated[Spike, merge_dict]
+    control:  Annotated[Control, merge_dict]
 
-    # ── Plan stage ────────────────────────────────────────────────────────────
-    plan_content: str
-
-    # ── Implementation stage ──────────────────────────────────────────────────
-    worktree_path: str
-    repo_local_path: str
-
-    # ── PR stage ──────────────────────────────────────────────────────────────
-    pr_url: str
-    pr_number: int
-
-    # ── CI / review tracking ──────────────────────────────────────────────────
-    ci_status: str          # "pass" | "fail" | "pending" | "unknown"
-    ci_fix_count: int       # how many times fix_ci has run
-    review_comment_round: int  # how many respond_to_review rounds completed
-
-    # ── Self-review ───────────────────────────────────────────────────────────
-    self_review_passed: bool
-    self_review_retry_count: int  # how many self-review → re-implement loops
-
-    # ── Spike follow-ups ──────────────────────────────────────────────────────
-    followup_tickets: list  # list of created issue numbers
-
-    # ── Error accumulation ────────────────────────────────────────────────────
-    errors: list
-
-    # ── Spawn tracking (for staleness detection / marker polling) ─────────────
-    last_fired_at: float
-    last_run_id: str
-
-    # ── Routing values set by wait nodes ──────────────────────────────────────
-    # These are written by interrupt-wait nodes and consumed by conditional edges.
-    pr_outcome: str              # "done" | "fix_ci" | "respond" | "needs_human"
-    impl_approval_type: str      # "impl-approved" | "followup-approved"
-
-    _plan_marker_outcome: str         # "done" | "error"
-    _impl_marker_outcome: str         # "done" | "error"
-    _quality_check_outcome: str       # "done" | "error"
-    _self_review_outcome: str         # "done" | "error"
-    _ship_marker_outcome: str         # "done" | "error"
-    _fix_ci_outcome: str              # "done" | "needs_human"
-    _respond_outcome: str             # "done" | "needs_human"
-    _followups_outcome: str           # "done" | "error"
+    # Append-only lists at TOP LEVEL — reducers fire correctly here
+    commit_shas:          Annotated[list[str], add]
+    quality_history:      Annotated[list[dict], add]
+    run_history:          Annotated[list[RunRecord], add]
+    errors:               Annotated[list[str], add]
+    responded_thread_ids: Annotated[list[str], add]
+    followup_tickets:     Annotated[list[int], add]

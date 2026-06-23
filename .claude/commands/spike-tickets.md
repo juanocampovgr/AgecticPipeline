@@ -79,3 +79,39 @@ Research a spike ticket and optionally create actionable follow-up tickets from 
 - Follow-up tasks should be concrete and independently actionable
 - Each follow-up task should map to a single repo (android/ios/backend)
 - If no clear actionable tasks emerge from the research, skip the Follow-up Tasks section
+
+---
+
+## Write Pipeline Result
+
+**Spike research mode** (no `--create-followups` flag):
+After posting the research document comment:
+```bash
+if [ -n "$PIPELINE_RESULT_PATH" ]; then
+  mkdir -p "$(dirname "$PIPELINE_RESULT_PATH")"
+  printf '{"outcome":"done","research_doc_url":"%s"}' "<GITHUB_COMMENT_URL>" > "$PIPELINE_RESULT_PATH"
+fi
+```
+
+**Followups creation mode** (`--create-followups` flag):
+After creating the follow-up tickets and posting the `<!-- ai-followups:done -->` comment:
+```bash
+if [ -n "$PIPELINE_RESULT_PATH" ]; then
+  mkdir -p "$(dirname "$PIPELINE_RESULT_PATH")"
+  # followup_ticket_numbers = array of newly created issue numbers
+  cat > "$PIPELINE_RESULT_PATH" << RESULT_EOF
+{
+  "outcome": "done",
+  "followup_ticket_numbers": [<ISSUE_NUMBERS_COMMA_SEPARATED>]
+}
+RESULT_EOF
+fi
+```
+
+On error for either mode:
+```bash
+if [ -n "$PIPELINE_RESULT_PATH" ]; then
+  mkdir -p "$(dirname "$PIPELINE_RESULT_PATH")"
+  printf '{"outcome":"error","error":"%s"}' "<ERROR>" > "$PIPELINE_RESULT_PATH"
+fi
+```

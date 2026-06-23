@@ -77,3 +77,23 @@ Fix a failing CI check on a pull request. Fetches CI logs, classifies the failur
 - Maximum 3 files changed per CI fix
 - If the fix requires changing more than 3 files, treat as out-of-scope
 - Do NOT change test assertions to make tests pass — fix the implementation instead
+
+---
+
+## Write Pipeline Result
+
+After posting `<!-- ai-ci-fix:done -->`:
+```bash
+if [ -n "$PIPELINE_RESULT_PATH" ]; then
+  mkdir -p "$(dirname "$PIPELINE_RESULT_PATH")"
+  echo '{"outcome":"done"}' > "$PIPELINE_RESULT_PATH"
+fi
+```
+
+After posting `<!-- ai-ci-fix:needs-human -->`:
+```bash
+if [ -n "$PIPELINE_RESULT_PATH" ]; then
+  mkdir -p "$(dirname "$PIPELINE_RESULT_PATH")"
+  printf '{"outcome":"needs_human","error":"%s"}' "<REASON>" > "$PIPELINE_RESULT_PATH"
+fi
+```
