@@ -109,6 +109,12 @@ def apply_event(snap: Snapshot, ev: dict) -> None:
         snap.jira_id = payload.get("jira_id", snap.jira_id)
         snap.is_spike = bool(payload.get("is_spike", snap.is_spike))
         snap.status = payload.get("status", snap.status)
+        # Each ticket_grabbed marks a new graph run — reset stage state so stale
+        # failed/crash events from prior runs don't bleed into the new run's view.
+        snap.stages.clear()
+        snap.current_stage = None
+        snap.terminal = False
+        snap.terminal_outcome = ""
         return
 
     if kind == "heartbeat":

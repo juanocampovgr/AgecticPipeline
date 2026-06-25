@@ -429,6 +429,9 @@ async def run_stage(
                     error=f"Cached result parse error: {e}",
                     record=RunRecord(stage=stage, result_path=str(result_path), outcome="error"),
                 )
+            # Emit events so the dashboard overwrites any stale failed/crash state
+            # from prior runs that are still in the append-only events file.
+            _emit_stage_finish(ticket, stage, result, log_path=None)
             return result
         # File exists but incomplete (crash mid-write) — await without re-launching
         print(
