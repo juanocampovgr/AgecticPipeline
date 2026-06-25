@@ -31,7 +31,7 @@ async def node_ship(
         await move_status(client, identity["item_id"], "Ready To Ship - AI")
 
     context = {
-        "command":       "/ship-tickets",
+        "command":       "/ship-agentic-ticket",
         "tools":         "Bash,Read,Grep,Glob,Edit,Write,Agent",
         "extra_args":    "",
         "worktree_path": worktree_path,

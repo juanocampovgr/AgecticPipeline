@@ -42,7 +42,7 @@ STALE_THRESHOLD: dict[str, int] = {
     "AI Planning":         int(os.environ.get("STALE_PLAN_SECONDS",     "900")),
     "AI Implementation":   int(os.environ.get("STALE_IMPL_SECONDS",     "3600")),
     "AI Quality Check":    int(os.environ.get("STALE_QUALITY_SECONDS",  "2400")),
-    "Ready To Ship - AI":  int(os.environ.get("STALE_SHIP_SECONDS",     "600")),
+    "Ready To Ship - AI":  int(os.environ.get("STALE_SHIP_SECONDS",     "120")),
     "Self Review":         int(os.environ.get("STALE_SELF_REVIEW_SECONDS", "1800")),
     "Fix CI":              int(os.environ.get("STALE_FIX_CI_SECONDS",   "3600")),
     "Respond To Review":   int(os.environ.get("STALE_RESPOND_SECONDS",  "3600")),
@@ -93,6 +93,27 @@ def _scan_log_for_transient_error(log_path: Path) -> bool:
         return any(p in tail for p in TRANSIENT_PATTERNS)
     except Exception:
         return False
+
+
+_OFFSCRIPT_LOG_PATTERNS: dict[str, tuple[bytes, ...]] = {
+    "Ready To Ship - AI": (
+        b"./gradlew",
+        b"BUILD SUCCESSFUL",
+        b"Waiting for unit tests",
+        b"Lint \xe2\x9c\x85",  # "Lint ✅"
+    ),
+}
+
+
+def _scan_log_for_offscript(log_path: Path, stage: str) -> bytes | None:
+    """Return the first forbidden pattern found in the log, or None."""
+    patterns = _OFFSCRIPT_LOG_PATTERNS.get(stage)
+    if not patterns:
+        return None
+    try:
+        return next((p for p in patterns if p in log_path.read_bytes()), None)
+    except Exception:
+        return None
 
 
 # Stage-specific log patterns that confirm successful completion.
@@ -240,6 +261,30 @@ async def _wait_and_parse(
                     result_path=str(result_path),
                 ),
             )
+
+        # Detect if the skill ran a forbidden command (e.g. gradlew inside ship).
+        # Surface this as an attributable error immediately rather than timing out.
+        if log_path:
+            offscript = _scan_log_for_offscript(log_path, stage)
+            if offscript:
+                err_msg = f"ship ran forbidden command: {offscript.decode(errors='replace')}"
+                try:
+                    result_path.parent.mkdir(parents=True, exist_ok=True)
+                    result_path.write_text(
+                        json.dumps({"outcome": "error", "error": err_msg}),
+                        encoding="utf-8",
+                    )
+                except Exception:
+                    pass
+                return StageResult(
+                    outcome="error",
+                    error=err_msg,
+                    record=RunRecord(
+                        stage=stage, started_at=started,
+                        finished_at=time.time(), outcome="error",
+                        result_path=str(result_path),
+                    ),
+                )
 
         # If the subprocess already exited but hasn't written the result file yet,
         # start a grace countdown so we don't stall for the full timeout.
