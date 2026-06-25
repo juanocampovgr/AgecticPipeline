@@ -12,13 +12,12 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import subprocess
-import tempfile
 import time
 import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from graph import events
 from graph.schemas import RunRecord, StageResult
 
 if TYPE_CHECKING:
@@ -96,6 +95,55 @@ def _scan_log_for_transient_error(log_path: Path) -> bool:
         return False
 
 
+# Stage-specific log patterns that confirm successful completion.
+# Used to auto-recover when a skill exits rc=0 without writing its result file.
+_SUCCESS_LOG_PATTERNS: dict[str, bytes] = {
+    "AI Quality Check":    b"quality-check Complete",
+    "AI Implementation":   b"code-tickets Complete",
+    "Self Review":         b"Self-review passed",
+    "Ready To Ship - AI":  b"Ship complete",
+    "Fix CI":              b"fix-ci-failure Complete",
+    "Respond To Review":   b"respond-to-review Complete",
+    "Spike Followups":     b"spike-tickets Complete",
+    "AI Planning":         b"plan-github-tickets Complete",
+}
+
+
+def _try_recover_result_from_log(
+    log_path: Path,
+    result_path: Path,
+    stage: str,
+) -> bool:
+    """If the log signals successful completion but no result file was written,
+    write a minimal 'done' result so the pipeline can advance.
+
+    Returns True if recovery succeeded (result file now exists and is valid).
+    """
+    pattern = _SUCCESS_LOG_PATTERNS.get(stage)
+    if not pattern:
+        return False
+    try:
+        content = log_path.read_bytes()
+        if pattern not in content:
+            return False
+        # Log shows successful completion — write a minimal done result.
+        result_path.parent.mkdir(parents=True, exist_ok=True)
+        result_path.write_text(
+            json.dumps({"outcome": "done", "auto_recovered": True,
+                        "note": f"result file written by runner after {stage} log showed success"}),
+            encoding="utf-8",
+        )
+        print(
+            f"[{time.strftime('%H:%M:%S')}] {stage}: log shows success but no result file — "
+            f"auto-wrote done result",
+            flush=True,
+        )
+        return True
+    except Exception as e:
+        print(f"[{time.strftime('%H:%M:%S')}] {stage}: log-recovery failed: {e}", flush=True)
+        return False
+
+
 # ── Path computation ──────────────────────────────────────────────────────────
 
 def compute_result_path(state: "TicketState", stage: str) -> Path:
@@ -139,9 +187,24 @@ def _try_read_complete(result_path: Path) -> dict | None:
     return None
 
 
-async def _wait_and_parse(result_path: Path, timeout: float, stage: str) -> StageResult:
-    """Poll result_path until it appears and is complete, or timeout elapses."""
+_PROC_EXIT_GRACE = 30  # seconds to wait after subprocess exits before declaring crash
+
+
+async def _wait_and_parse(
+    result_path: Path,
+    timeout: float,
+    stage: str,
+    proc: "asyncio.subprocess.Process | None" = None,
+    log_path: "Path | None" = None,
+) -> StageResult:
+    """Poll result_path until it appears and is complete, or timeout elapses.
+
+    If proc is provided and exits without writing the result file, wait a short
+    grace window then return outcome='crash' instead of polling for the full timeout.
+    """
     started = time.time()
+    proc_exited_at: float | None = None
+
     while True:
         if result_path.exists():
             raw = _try_read_complete(result_path)
@@ -177,85 +240,55 @@ async def _wait_and_parse(result_path: Path, timeout: float, stage: str) -> Stag
                     result_path=str(result_path),
                 ),
             )
+
+        # If the subprocess already exited but hasn't written the result file yet,
+        # start a grace countdown so we don't stall for the full timeout.
+        if proc is not None and proc.returncode is not None:
+            if proc_exited_at is None:
+                proc_exited_at = time.time()
+                print(
+                    f"[{time.strftime('%H:%M:%S')}] {stage}: subprocess exited "
+                    f"rc={proc.returncode} — waiting {_PROC_EXIT_GRACE}s grace for result file",
+                    flush=True,
+                )
+            elif time.time() - proc_exited_at >= _PROC_EXIT_GRACE:
+                # Before declaring crash, attempt log-based recovery for stages
+                # where the skill logs a success marker but skips the file write.
+                if log_path and _try_recover_result_from_log(log_path, result_path, stage):
+                    # Recovery wrote the file — loop will pick it up next tick
+                    proc_exited_at = None  # reset so we don't re-trigger
+                    continue
+                return StageResult(
+                    outcome="crash",
+                    error=(
+                        f"Stage '{stage}' subprocess exited rc={proc.returncode} "
+                        f"without writing result file after {_PROC_EXIT_GRACE}s grace"
+                    ),
+                    record=RunRecord(
+                        stage=stage, started_at=started,
+                        finished_at=time.time(), outcome="crash",
+                        result_path=str(result_path),
+                    ),
+                )
+
         await asyncio.sleep(RESULT_POLL_INTERVAL)
 
 
-# ── Launchers ─────────────────────────────────────────────────────────────────
-
-def _launch_visible_terminal(
-    state: "TicketState",
-    stage: str,
-    result_path: Path,
-    context: dict,
-) -> str:
-    """Open a macOS Terminal window running the skill.  Returns a run_id string."""
-    identity      = state.get("identity") or {}
-    ticket        = identity.get("ticket_number", 0)
-    worktree_path = context.get("worktree_path", "")
-    command       = context["command"]
-    allowed_tools = context.get("tools", "Bash,Read,Grep,Glob,Edit,Write,Agent")
-    extra_args    = context.get("extra_args", "").strip()
-    claude        = _claude_bin()
-    run_id        = f"{stage.replace(' ', '_')}-{ticket}-{uuid.uuid4().hex[:8]}-terminal"
-    win_title     = f"Claude #{ticket} — {stage}"
-
-    result_path.parent.mkdir(parents=True, exist_ok=True)
-
-    full_cmd = f"{command} --ticket {ticket}"
-    if extra_args:
-        full_cmd = f"{command} {extra_args} --ticket {ticket}"
-
-    script_lines = ["#!/bin/zsh"]
-    script_lines.append(f'export PIPELINE_RESULT_PATH="{result_path}"')
-    if worktree_path:
-        script_lines.append(f'cd "{worktree_path}"')
-    script_lines += [
-        f"echo '=== Claude #{ticket} — {stage} ==='",
-        "echo ''",
-        f"{claude} -p '{full_cmd}' --allowedTools '{allowed_tools}'",
-        "echo ''",
-        "echo '=== done (press any key to close) ==='",
-        "read -k1",
-    ]
-
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".sh", delete=False, prefix="claude_pipe_"
-    ) as f:
-        f.write("\n".join(script_lines) + "\n")
-        script_path = f.name
-    os.chmod(script_path, 0o755)
-
-    result = subprocess.run(
-        [
-            "osascript",
-            "-e", 'tell application "Terminal"',
-            "-e", "activate",
-            "-e", f'set t to do script "{script_path}"',
-            "-e", f'set custom title of t to "{win_title}"',
-            "-e", "end tell",
-        ],
-        capture_output=True, text=True, check=False,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"osascript failed for {stage}: {result.stderr.strip() or result.stdout.strip()}"
-        )
-    print(f"[{time.strftime('%H:%M:%S')}] terminal spawned for #{ticket} → {stage}", flush=True)
-    return run_id
-
+# ── Launcher ──────────────────────────────────────────────────────────────────
 
 async def _launch_headless(
     state: "TicketState",
     stage: str,
     result_path: Path,
     context: dict,
-) -> str:
-    """Launch a headless Claude process (fire-and-forget). Returns run_id."""
+) -> tuple[str, Path, "asyncio.subprocess.Process"]:
+    """Launch a headless Claude process (fire-and-forget). Returns (run_id, log_path, proc)."""
     identity      = state.get("identity") or {}
     ticket        = identity.get("ticket_number", 0)
     command       = context["command"]
     allowed_tools = context.get("tools", "Bash,Read,Grep,Glob,Agent")
     extra_args    = context.get("extra_args", "").strip()
+    worktree_path = context.get("worktree_path", "")
     claude        = _claude_bin()
     run_id        = f"{stage.replace(' ', '_')}-{ticket}-{uuid.uuid4().hex[:8]}"
     log_path      = _log_dir() / f"{run_id}.log"
@@ -274,13 +307,18 @@ async def _launch_headless(
     logf = open(log_path, "wb")  # noqa: WPS515 — kept open by background task
     logf.write(
         f"=== run_id={run_id} ticket={ticket} stage='{stage}' "
-        f"mode=headless started={time.strftime('%Y-%m-%dT%H:%M:%S')} "
+        f"started={time.strftime('%Y-%m-%dT%H:%M:%S')} "
+        f"cwd={worktree_path or os.getcwd()} "
         f"result_path={result_path} ===\n".encode()
     )
     logf.flush()
 
     proc = await asyncio.create_subprocess_exec(
-        *cmd, stdout=logf, stderr=asyncio.subprocess.STDOUT, env=env,
+        *cmd,
+        stdout=logf,
+        stderr=asyncio.subprocess.STDOUT,
+        env=env,
+        cwd=worktree_path or None,
     )
 
     async def _watch() -> None:
@@ -296,8 +334,8 @@ async def _launch_headless(
                 pass
 
     asyncio.create_task(_watch())
-    print(f"[{time.strftime('%H:%M:%S')}] headless spawned for #{ticket} → {stage} [{log_path.name}]", flush=True)
-    return run_id
+    print(f"[{time.strftime('%H:%M:%S')}] launched #{ticket} → {stage} [{log_path.name}]", flush=True)
+    return run_id, log_path, proc
 
 
 # ── Main entry point ──────────────────────────────────────────────────────────
@@ -307,14 +345,17 @@ async def run_stage(
     stage: str,
     context: dict,
 ) -> StageResult:
-    """Idempotent stage runner.
+    """Idempotent stage runner — every stage runs headless.
 
     context keys:
-        command     (str)  — slash-command to run, e.g. "/plan-github-tickets"
-        tools       (str)  — comma-separated allowed tools
-        spawn_mode  (str)  — "terminal" | "headless"
-        extra_args  (str)  — optional extra args prepended to --ticket
-        worktree_path (str) — cd target for terminal spawns
+        command       (str) — slash-command to run, e.g. "/plan-github-tickets"
+        tools         (str) — comma-separated allowed tools
+        extra_args    (str) — optional extra args prepended to --ticket
+        worktree_path (str) — cd target for the subprocess (optional)
+
+    `spawn_mode` is accepted for backwards compatibility but ignored; all
+    stages now run headless and progress is surfaced via the per-ticket
+    dashboard TUI (see graph/events.py + pipeline/dashboard.py).
 
     Re-entry scenarios:
         result file complete   → return without re-launching
@@ -349,24 +390,29 @@ async def run_stage(
             f"[{time.strftime('%H:%M:%S')}] #{ticket}: {stage} result incomplete → awaiting",
             flush=True,
         )
-        return await _wait_and_parse(result_path, timeout, stage)
+        events.emit(ticket, stage, "stage_started", {
+            "result_path": str(result_path),
+            "attempt": 0,
+            "resumed": True,
+        })
+        last_result = await _wait_and_parse(result_path, timeout, stage)
+        _emit_stage_finish(ticket, stage, last_result, log_path=None)
+        return last_result
 
     # Fresh entry: launch then await (with transient-error retry)
-    spawn_mode = context.get("spawn_mode", "headless")
     started_at = time.time()
     last_log_path: Path | None = None
     last_result: StageResult | None = None
 
     for attempt in range(MAX_SUBPROCESS_RETRIES):
-        if spawn_mode == "terminal":
-            # Terminal spawns are visible to the user; don't retry silently
-            _launch_visible_terminal(state, stage, result_path, context)
-            last_result = await _wait_and_parse(result_path, timeout, stage)
-            break
-        else:
-            run_id = await _launch_headless(state, stage, result_path, context)
-            last_log_path = _log_dir() / f"{run_id}.log"
-            last_result = await _wait_and_parse(result_path, timeout, stage)
+        run_id, last_log_path, last_proc = await _launch_headless(state, stage, result_path, context)
+        events.emit(ticket, stage, "stage_started", {
+            "result_path": str(result_path),
+            "log_path":    str(last_log_path),
+            "run_id":      run_id,
+            "attempt":     attempt,
+        })
+        last_result = await _wait_and_parse(result_path, timeout, stage, proc=last_proc, log_path=last_log_path)
 
         # On success or non-transient failure, stop retrying
         if last_result.outcome == "done":
@@ -386,6 +432,12 @@ async def run_stage(
                 f"(attempt {attempt + 1}/{MAX_SUBPROCESS_RETRIES}) — retrying in {wait}s",
                 flush=True,
             )
+            events.emit(ticket, stage, "stage_retry", {
+                "attempt": attempt + 1,
+                "max":     MAX_SUBPROCESS_RETRIES,
+                "reason":  "transient error",
+                "wait_s":  wait,
+            })
             await asyncio.sleep(wait)
             # Remove partial result file before re-launching so idempotency guard doesn't fire
             try:
@@ -404,4 +456,28 @@ async def run_stage(
     if not result.record.stage:
         result.record.stage = stage
 
+    _emit_stage_finish(ticket, stage, result, log_path=last_log_path)
     return result
+
+
+def _emit_stage_finish(
+    ticket: int,
+    stage: str,
+    result: StageResult,
+    log_path: Path | None,
+) -> None:
+    payload: dict = {
+        "outcome": result.outcome,
+        "log_path": str(log_path) if log_path else None,
+    }
+    if result.outcome == "done":
+        if result.branch:
+            payload["branch"] = result.branch
+        if result.pr_url:
+            payload["pr_url"] = result.pr_url
+        if result.pr_number:
+            payload["pr_number"] = result.pr_number
+        events.emit(ticket, stage, "stage_completed", payload)
+    else:
+        payload["error"] = (result.error or "")[:500]
+        events.emit(ticket, stage, "stage_failed", payload)

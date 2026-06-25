@@ -81,3 +81,16 @@ Review your own implementation of a GitHub ticket before sending it for human re
 - Be honest and critical. The goal is to catch real bugs before human review.
 - Only mark as failed if there are genuine blockers; style nits alone don't fail.
 - Do NOT push any code changes — this is a read-only review.
+
+---
+
+## EPILOGUE — Guaranteed result-file write
+
+Before exiting for **any** reason, check that the result file was written:
+
+```bash
+if [ -n "$PIPELINE_RESULT_PATH" ] && [ ! -s "$PIPELINE_RESULT_PATH" ]; then
+  mkdir -p "$(dirname "$PIPELINE_RESULT_PATH")"
+  printf '{"outcome":"error","error":"skill exited without writing result"}' > "$PIPELINE_RESULT_PATH"
+fi
+```

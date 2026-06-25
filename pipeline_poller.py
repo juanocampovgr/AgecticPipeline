@@ -42,6 +42,22 @@ from github_api import (
     post_issue_comment,
     fetch_ci_status,
 )
+from graph import events as graph_events
+from graph.terminal import open_dashboard as _open_dashboard_terminal
+from graph.runner import compute_result_path
+
+# Stage name (RunRecord.stage) → graph node name. Mirrors graph/nodes/recover.py;
+# kept in lockstep — if you add a new pipeline stage, add it in both places.
+_STAGE_TO_NODE: dict[str, str] = {
+    "AI Planning":        "plan",
+    "AI Implementation":  "implement",
+    "AI Quality Check":   "quality",
+    "Self Review":        "self_review",
+    "Ready To Ship - AI": "ship",
+    "Fix CI":             "fix_ci",
+    "Respond To Review":  "respond",
+    "Spike Followups":    "followups",
+}
 
 # ── Config ───────────────────────────────────────────────────────────────────
 
@@ -353,6 +369,28 @@ def _setup_worktree_sync(repo_local_path: str, ticket: int, branch_id: str = "",
     )
     _log(f"  setup_worktree: fetch rc={r.returncode}")
 
+    # Check whether the target branch already exists on the remote. If it does,
+    # fetch it and create the worktree from the remote tip so the local history
+    # matches — a regular `git push` will then be a fast-forward, not rejected.
+    remote_branch_exists = subprocess.run(
+        ["git", "-C", repo_local_path, "ls-remote", "--exit-code", "--heads", "origin", branch],
+        capture_output=True, text=True, check=False,
+    ).returncode == 0
+
+    if remote_branch_exists:
+        rf = subprocess.run(
+            ["git", "-C", repo_local_path, "fetch", "origin", f"{branch}:{branch}"],
+            capture_output=True, text=True, check=False,
+        )
+        if rf.returncode == 0:
+            _log(f"  setup_worktree: remote branch '{branch}' found — using it as worktree base")
+            worktree_base = branch
+        else:
+            _log(f"  setup_worktree: remote branch fetch failed (rc={rf.returncode}), falling back to {base}")
+            worktree_base = base
+    else:
+        worktree_base = base
+
     current = subprocess.run(
         ["git", "-C", repo_local_path, "rev-parse", "--abbrev-ref", "HEAD"],
         capture_output=True, text=True,
@@ -372,14 +410,33 @@ def _setup_worktree_sync(repo_local_path: str, ticket: int, branch_id: str = "",
     if r.returncode != 0 and "not found" not in r.stderr and branch not in r.stderr:
         raise RuntimeError(f"branch -D {branch} failed: {r.stderr.strip()}")
 
-    result = subprocess.run(
-        ["git", "-C", repo_local_path, "worktree", "add", "-b", branch, worktree_path, base],
-        capture_output=True, text=True, check=False,
-    )
+    # When using an existing remote branch as the base, the branch name already
+    # matches so we use `git worktree add` without `-b` (checkout, not create).
+    if worktree_base == branch:
+        result = subprocess.run(
+            ["git", "-C", repo_local_path, "worktree", "add", worktree_path, branch],
+            capture_output=True, text=True, check=False,
+        )
+    else:
+        result = subprocess.run(
+            ["git", "-C", repo_local_path, "worktree", "add", "-b", branch, worktree_path, worktree_base],
+            capture_output=True, text=True, check=False,
+        )
     if result.returncode != 0:
         raise RuntimeError(f"git worktree add failed: {result.stderr.strip()}")
 
-    _log(f"  setup_worktree: SUCCESS at {worktree_path}")
+    head_sha = subprocess.run(
+        ["git", "-C", worktree_path, "rev-parse", "HEAD"],
+        capture_output=True, text=True, check=False,
+    ).stdout.strip()
+    remote_sha = subprocess.run(
+        ["git", "-C", repo_local_path, "rev-parse", f"origin/{branch}"],
+        capture_output=True, text=True, check=False,
+    ).stdout.strip()
+    _log(
+        f"  setup_worktree: SUCCESS at {worktree_path} "
+        f"HEAD={head_sha[:12]} remote={remote_sha[:12] if remote_sha else 'none'}"
+    )
     return worktree_path
 
 
@@ -473,8 +530,16 @@ async def _handle_gate(
     repo_full = item["repo_full"]
     labels = item.get("labels", [])
 
+    thread_id = config["configurable"]["thread_id"]
+
     async def resume(payload: dict) -> None:
-        await workflow.ainvoke(Command(resume=payload), config)
+        # Register in _active_threads so concurrent poll cycles don't spawn a
+        # second _run_thread while this ainvoke is blocking in run_stage.
+        _active_threads.add(thread_id)
+        try:
+            await workflow.ainvoke(Command(resume=payload), config)
+        finally:
+            _active_threads.discard(thread_id)
         _log(f"    #{ticket}: resumed gate '{interrupt_value}' with {payload}")
 
     # ── Gate 1: plan-approved label ───────────────────────────────────────────
@@ -579,6 +644,79 @@ def _build_initial_state(
     return state
 
 
+# ── Dashboard helper ──────────────────────────────────────────────────────────
+
+def _open_dashboard(item: dict, status: str | None = None) -> None:
+    """Open the per-ticket dashboard window and announce the grab over the event bus.
+
+    Safe to call multiple times: the terminal opener no-ops if a live dashboard
+    pid is already on file, and the event log replays from offset 0 on attach.
+    """
+    ticket = item["issue_number"]
+    title  = item.get("title", "") or ""
+    _open_dashboard_terminal(ticket, title)
+    graph_events.emit(ticket, None, "ticket_grabbed", {
+        "ticket":   ticket,
+        "title":    title,
+        "repo":     item.get("repo", ""),
+        "repo_full": item.get("repo_full", ""),
+        "jira_id":  "",  # filled in by individual nodes when known
+        "is_spike": _is_spike(item),
+        "status":   status or item.get("status", ""),
+    })
+
+
+# ── Recovery helpers (used by reconcile_once dead-END branch) ─────────────────
+
+async def _clear_checkpoint(thread_id: str) -> None:
+    """Delete LangGraph checkpoint rows for a thread so a fresh run can start.
+
+    Uses aiosqlite (bundled with langgraph-checkpoint-sqlite) to avoid blocking
+    the event loop. The new run will repopulate the checkpoint as it executes.
+    """
+    try:
+        import aiosqlite  # noqa: PLC0415
+        async with aiosqlite.connect(str(GRAPH_DB_PATH)) as db:
+            await db.execute("DELETE FROM checkpoints WHERE thread_id = ?", (thread_id,))
+            await db.execute("DELETE FROM writes WHERE thread_id = ?", (thread_id,))
+            await db.commit()
+        _log(f"    checkpoint cleared for thread_id='{thread_id}'")
+    except Exception as e:
+        _log(f"    WARNING: could not clear checkpoint for '{thread_id}': {e}")
+
+
+def _compute_recovery_target(prev_values: dict) -> tuple[str | None, dict | None]:
+    """Return (graph_node_name, failed_run_record) for the last non-done stage.
+
+    Walks run_history from newest to oldest, returns the first failed stage.
+    None / None when there is no failure recorded (e.g. successful Done ticket
+    moved back to Ready To Pick Up — operator-driven full rerun).
+    """
+    history = prev_values.get("run_history") or []
+    for entry in reversed(history):
+        outcome = entry.get("outcome")
+        if outcome and outcome != "done":
+            node = _STAGE_TO_NODE.get(entry.get("stage", ""))
+            if node:
+                return node, entry
+    return None, None
+
+
+def _clear_failed_result_file(ticket: int, stage: str, prev_values: dict) -> None:
+    """Delete the cached result file for the failed stage so it actually re-runs.
+
+    Earlier successful stages keep their result files → run_stage's idempotency
+    guard returns them instantly on the rerun (no wasted work).
+    """
+    try:
+        path = compute_result_path(prev_values, stage)
+        if path.exists():
+            path.unlink()
+            _log(f"    #{ticket}: removed failed result file {path.name}")
+    except Exception as e:
+        _log(f"    WARNING: could not remove failed result file for #{ticket} '{stage}': {e}")
+
+
 # ── Main reconciliation loop ──────────────────────────────────────────────────
 
 async def reconcile_once(workflow) -> None:
@@ -592,6 +730,11 @@ async def reconcile_once(workflow) -> None:
             return
 
         _log(f"  board returned {len(board)} item(s)")
+
+        for item in board:
+            graph_events.emit(item["issue_number"], None, "heartbeat", {
+                "status": item.get("status", ""),
+            })
 
         for item in board:
             ticket = item["issue_number"]
@@ -632,6 +775,8 @@ async def reconcile_once(workflow) -> None:
                         initial_request=body,
                         initial_request_url=f"https://github.com/{item['repo_full']}/issues/{ticket}",
                     )
+                    _open_dashboard(item, status="AI Planning")
+                    graph_events.emit(ticket, None, "status_changed", {"status": "AI Planning"})
                     asyncio.create_task(_run_thread(workflow, thread_id, initial))
 
                 elif status == "Ready to Review then Plan" and "plan-approved" in item.get("labels", []):
@@ -654,6 +799,8 @@ async def reconcile_once(workflow) -> None:
                         initial_request=body,
                         initial_request_url=f"https://github.com/{item['repo_full']}/issues/{ticket}",
                     )
+                    _open_dashboard(item, status="AI Implementation")
+                    graph_events.emit(ticket, None, "status_changed", {"status": "AI Implementation"})
                     asyncio.create_task(_run_thread(workflow, thread_id, initial))
                     await _gql_remove_label(client, item["issue_node_id"], item["repo_full"], "plan-approved")
 
@@ -687,17 +834,74 @@ async def reconcile_once(workflow) -> None:
                 # process (poller restarted). Pass None — LangGraph resumes from last
                 # checkpoint; run_stage() idempotency handles re-launch vs read.
                 _log(f"    #{ticket}: restart recovery — resuming from checkpoint")
+                _open_dashboard(item, status=status)
                 asyncio.create_task(_run_thread(workflow, thread_id, None))
             elif graph_snapshot.next:
                 _log(f"    #{ticket}: node running in this process — skip")
+            elif status == "Ready To Pick Up":
+                # ── Dead-END recovery ──────────────────────────────────────
+                # Graph reached END (escalate_error / needs_human / done) and the
+                # operator moved the ticket back to "Ready To Pick Up". Build a
+                # recovery state and start a fresh thread that enters at
+                # `node_recover` — which will route to the failed stage.
+                prev_values = graph_snapshot.values or {}
+                target, failed_run = _compute_recovery_target(prev_values)
+                if target is None:
+                    _log(f"    #{ticket}: graph at END + Ready To Pick Up but no failed stage found — fresh restart")
+                    await _clear_checkpoint(thread_id)
+                    continue  # next poll will hit the standard "Ready To Pick Up" path
+                _log(f"    #{ticket}: dead-END recovery → resume at '{target}'")
+                _clear_failed_result_file(ticket, (failed_run or {}).get("stage", ""), prev_values)
+                await _clear_checkpoint(thread_id)
+                recovery_state = {
+                    **prev_values,
+                    "identity": {
+                        **(prev_values.get("identity") or {}),
+                        "is_recovery":     True,
+                        "recovery_target": target,
+                    },
+                }
+                _open_dashboard(item, status=status)
+                graph_events.emit(ticket, None, "status_changed", {"status": f"recovering → {target}"})
+                asyncio.create_task(_run_thread(workflow, thread_id, recovery_state))
             else:
                 _log(f"    #{ticket}: graph done — skip")
 
 
 # ── Main entry point ──────────────────────────────────────────────────────────
 
+_PID_FILE = PIPELINE_DIR / "poller.pid"
+
+
+def _acquire_pid_lock() -> bool:
+    """Write our PID to the lock file. Return False if another instance is running."""
+    if _PID_FILE.exists():
+        try:
+            other_pid = int(_PID_FILE.read_text().strip())
+            # Check if that process is actually alive
+            import subprocess as _sp
+            result = _sp.run(["kill", "-0", str(other_pid)], capture_output=True)
+            if result.returncode == 0:
+                _log(f"ERROR: another poller is already running (pid {other_pid}) — exiting")
+                return False
+        except Exception:
+            pass  # stale file — safe to overwrite
+    _PID_FILE.write_text(str(os.getpid()))
+    return True
+
+
+def _release_pid_lock() -> None:
+    try:
+        if _PID_FILE.exists() and _PID_FILE.read_text().strip() == str(os.getpid()):
+            _PID_FILE.unlink()
+    except Exception:
+        pass
+
+
 async def main():
     _validate_config()
+    if not _acquire_pid_lock():
+        sys.exit(1)
     _log("=== pipeline-poller starting (LangGraph edition) ===")
     _log(f"  project:   #{PROJECT_NUMBER} owner={PROJECT_OWNER}")
     _log(f"  claude:    {CLAUDE_BIN}")
@@ -725,6 +929,7 @@ async def main():
                 [p for p, _ in process_utils.find_pipeline_claude_pids()],
                 grace_seconds=2.0, log=_log,
             )
+            _release_pid_lock()
             stop_event.set()
 
         for sig in (signal.SIGTERM, signal.SIGINT):
@@ -742,6 +947,7 @@ async def main():
                 pass
 
         _log("=== pipeline-poller stopped ===")
+        _release_pid_lock()
 
 
 async def reset_thread(ticket: int, *, dry_run: bool = False) -> None:

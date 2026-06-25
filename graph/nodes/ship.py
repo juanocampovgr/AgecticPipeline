@@ -33,7 +33,6 @@ async def node_ship(
     context = {
         "command":       "/ship-tickets",
         "tools":         "Bash,Read,Grep,Glob,Edit,Write,Agent",
-        "spawn_mode":    "terminal",
         "extra_args":    "",
         "worktree_path": worktree_path,
     }

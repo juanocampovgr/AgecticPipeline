@@ -20,12 +20,11 @@ async def node_implement(
     is_spike  = identity.get("is_spike", False)
     _log(f"  #{ticket}: node_implement spike={is_spike}")
 
-    # ── Spike path (headless) ──────────────────────────────────────────────────
+    # ── Spike path ─────────────────────────────────────────────────────────────
     if is_spike:
         context = {
             "command":    "/spike-tickets",
             "tools":      "Bash,Read,Grep,Glob,Agent",
-            "spawn_mode": "headless",
             "extra_args": "",
         }
         res = await run_stage(state, "AI Implementation", context)
@@ -48,7 +47,7 @@ async def node_implement(
             },
         )
 
-    # ── Non-spike path (terminal with worktree) ────────────────────────────────
+    # ── Non-spike path (worktree-based) ────────────────────────────────────────
     try:
         worktree_path, repo_local = await resolve_worktree(state, store)
     except RuntimeError as exc:
@@ -64,10 +63,9 @@ async def node_implement(
         await move_status(client, identity["item_id"], "AI Implementation")
 
     context = {
-        "command":      "/code-tickets",
-        "tools":        "Bash,Read,Grep,Glob,Edit,Write,Agent",
-        "spawn_mode":   "terminal",
-        "extra_args":   "",
+        "command":       "/code-tickets",
+        "tools":         "Bash,Read,Grep,Glob,Edit,Write,Agent",
+        "extra_args":    "",
         "worktree_path": worktree_path,
     }
     res = await run_stage(state, "AI Implementation", context)

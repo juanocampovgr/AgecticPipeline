@@ -22,6 +22,10 @@ class Identity(TypedDict, total=False):
     labels: list[str]
     jira_ticket_id: str
     entry_point: Literal["plan", "implement"]
+    # Recovery: set by the poller when restarting an errored ticket so
+    # `node_recover` can route to the failed stage instead of starting fresh.
+    is_recovery: bool
+    recovery_target: str
 
 
 class RequestMemory(TypedDict, total=False):

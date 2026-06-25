@@ -30,8 +30,11 @@ def _get_compiled_graph():
     return build_workflow(MemorySaver())
 
 
-# Expected node names for the new LangGraph-native topology (§1b of the plan)
+# Expected node names for the new LangGraph-native topology (§1b of the plan).
+# `recover` is the entry node that pass-throughs to route_entry on fresh runs
+# and routes to the failed stage when restarting an errored ticket.
 EXPECTED_NODES = {
+    "recover",
     "route_entry",
     "plan",
     "gate_plan_approval",
@@ -88,15 +91,16 @@ class TestBuildWorkflow:
             f"Old spawn/wait nodes still present — refactor incomplete: {sorted(leftover)}"
         )
 
-    def test_route_entry_is_entry_point(self):
-        """The graph's entry node must be route_entry."""
+    def test_recover_is_entry_point(self):
+        """The graph's entry node must be `recover` (which pass-throughs to
+        route_entry for fresh runs and routes to the failed stage on recovery).
+        """
         graph = _get_compiled_graph()
         g = graph.get_graph()
-        # LangGraph represents the entry as an edge from __start__ to route_entry
         start_edges = [e for e in g.edges if e.source == "__start__"]
         targets = {e.target for e in start_edges}
-        assert "route_entry" in targets, (
-            f"route_entry is not the entry point; __start__ edges: {targets}"
+        assert "recover" in targets, (
+            f"recover is not the entry point; __start__ edges: {targets}"
         )
 
     def test_terminal_nodes_are_present(self):

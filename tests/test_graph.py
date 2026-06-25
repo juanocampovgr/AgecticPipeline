@@ -47,13 +47,18 @@ def test_workflow_compiles():
 
 
 def test_workflow_node_count():
-    """Graph must have exactly 17 nodes (15 domain + __start__ + __end__)."""
+    """Graph must have exactly 18 nodes (16 domain + __start__ + __end__).
+
+    Domain nodes: recover, route_entry, plan, gate_plan_approval, implement,
+    quality, self_review, gate_impl_approval, ship, monitor_pr, fix_ci,
+    respond, followups, done, needs_human, escalate_error.
+    """
     from langgraph.checkpoint.memory import MemorySaver
     from graph.workflow import build_workflow
 
     graph = build_workflow(MemorySaver())
     nodes = graph.get_graph().nodes
-    assert len(nodes) == 17, f"Expected 17 nodes, got {len(nodes)}: {set(nodes.keys())}"
+    assert len(nodes) == 18, f"Expected 18 nodes, got {len(nodes)}: {set(nodes.keys())}"
 
 
 def test_mermaid_renders():

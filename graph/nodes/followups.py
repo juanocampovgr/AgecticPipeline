@@ -23,7 +23,6 @@ async def node_followups(state: TicketState) -> Command[Literal["done", "escalat
     context = {
         "command":    "/spike-tickets --create-followups",
         "tools":      "Bash,Read,Grep,Glob,Agent",
-        "spawn_mode": "headless",
         "extra_args": "",
     }
     res = await run_stage(state, "Spike Followups", context)

@@ -20,7 +20,6 @@ async def node_plan(state: TicketState, store=None) -> Command[Literal["gate_pla
     context = {
         "command":    "/plan-github-tickets",
         "tools":      "Bash,Read,Grep,Glob,Agent",
-        "spawn_mode": "headless",
         "extra_args": "",
     }
     res = await run_stage(state, "AI Planning", context)

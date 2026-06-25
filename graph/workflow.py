@@ -3,6 +3,7 @@
 from langgraph.graph import StateGraph, END
 from graph.state import TicketState
 from graph.nodes import (
+    node_recover,
     node_route_entry,
     node_plan, gate_plan_approval,
     node_implement,
@@ -19,6 +20,7 @@ def build_workflow(checkpointer, store=None):
     builder = StateGraph(TicketState)
 
     # Register nodes
+    builder.add_node("recover",            node_recover)
     builder.add_node("route_entry",        node_route_entry)
     builder.add_node("plan",               node_plan)
     builder.add_node("gate_plan_approval", gate_plan_approval)
@@ -35,7 +37,10 @@ def build_workflow(checkpointer, store=None):
     builder.add_node("needs_human",        node_needs_human)
     builder.add_node("escalate_error",     node_escalate_error)
 
-    builder.set_entry_point("route_entry")
+    # `recover` is the new entry point — it pass-throughs to `route_entry` for
+    # normal runs and routes directly to the failed stage when restarting an
+    # errored ticket (see graph/nodes/recover.py).
+    builder.set_entry_point("recover")
 
     # All machine nodes return Command(goto=...) which LangGraph uses for routing.
     # We only declare edges to END for the three terminal nodes.

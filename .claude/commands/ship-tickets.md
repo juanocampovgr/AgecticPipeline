@@ -84,3 +84,16 @@ gh issue comment <N> --repo <ISSUE_REPO_FULL> --body "$(cat <<'EOF'
 EOF
 )"
 ```
+
+---
+
+## EPILOGUE — Guaranteed result-file write
+
+Before exiting for **any** reason, check that the result file was written:
+
+```bash
+if [ -n "$PIPELINE_RESULT_PATH" ] && [ ! -s "$PIPELINE_RESULT_PATH" ]; then
+  mkdir -p "$(dirname "$PIPELINE_RESULT_PATH")"
+  printf '{"outcome":"error","error":"skill exited without writing result"}' > "$PIPELINE_RESULT_PATH"
+fi
+```

@@ -359,3 +359,16 @@ Print:
 | git push fails (local fixes) | Run ERROR REPORTING PROCEDURE, EXIT |
 | Error comment post fails | Log and EXIT — poller staleness watchdog will flag it |
 | gh 401 auth error | Print `gh auth refresh -s repo`. EXIT. |
+
+---
+
+## EPILOGUE — Guaranteed result-file write
+
+Before exiting for **any** reason, check that the result file was written:
+
+```bash
+if [ -n "$PIPELINE_RESULT_PATH" ] && [ ! -s "$PIPELINE_RESULT_PATH" ]; then
+  mkdir -p "$(dirname "$PIPELINE_RESULT_PATH")"
+  printf '{"outcome":"error","error":"skill exited without writing result"}' > "$PIPELINE_RESULT_PATH"
+fi
+```

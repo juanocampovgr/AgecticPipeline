@@ -61,6 +61,61 @@ Parse `$ARGUMENTS`:
 
 ---
 
+## PHASE 0b — Detect already-implemented remote branch
+
+Before exploring any code, check whether the target remote branch already contains
+a previous pipeline implementation. If it does, reuse it instead of re-implementing
+from scratch — this prevents divergent-history push failures on pipeline restarts.
+
+```bash
+BRANCH="juanocampovgr/{ISSUE_NUMBER}"
+
+# Does the remote branch exist?
+if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+  # Fetch it locally so we can inspect it
+  git fetch origin "$BRANCH" 2>/dev/null
+
+  # Does the remote branch have any commits ahead of master?
+  AHEAD=$(git rev-list --count "origin/master..origin/$BRANCH" 2>/dev/null || echo 0)
+
+  if [ "$AHEAD" -gt 0 ]; then
+    echo "Remote branch '$BRANCH' is $AHEAD commit(s) ahead of master — reusing it."
+
+    # Bring the worktree in sync with the remote branch tip
+    git reset --hard "origin/$BRANCH"
+
+    HEAD_SHA=$(git rev-parse HEAD)
+
+    # Write a success result file so the pipeline can advance immediately
+    if [ -n "$PIPELINE_RESULT_PATH" ]; then
+      mkdir -p "$(dirname "$PIPELINE_RESULT_PATH")"
+      cat > "$PIPELINE_RESULT_PATH" << RESULT_EOF
+{
+  "outcome": "done",
+  "branch": "$BRANCH",
+  "files_changed": [],
+  "impl_summary": "Reusing existing implementation from remote branch (pipeline restart)",
+  "commit_shas": ["$HEAD_SHA"]
+}
+RESULT_EOF
+    fi
+
+    # Post the done marker so the poller can detect completion via comment too
+    gh issue comment {ISSUE_NUMBER} \
+      --repo {ISSUE_REPO_FULL} \
+      --body "**Implementation reused — existing branch** \`$BRANCH\` already contains a valid implementation commit (\`$HEAD_SHA\`). Advancing to quality check.
+
+<!-- ai-impl:done -->"
+
+    EXIT  # Skip all remaining phases
+  fi
+fi
+```
+
+If the branch does not exist or has no implementation commit, continue to PHASE 1.
+
+---
+
 ## PHASE 1 — Find the ticket
 
 If `--ticket N` passed: scan all three repos for the issue:
@@ -173,7 +228,21 @@ Collect the result JSON. If subagent returned error: log and EXIT.
 ```bash
 git add -A
 git commit -m "feat: AI implementation for #{ISSUE_NUMBER}"
-git push origin juanocampovgr/{ISSUE_NUMBER}
+
+# Guard: if the remote branch already existed, verify HEAD is a descendant before pushing.
+# Fail fast instead of force-pushing (forbidden).
+BRANCH="juanocampovgr/{ISSUE_NUMBER}"
+if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+  if ! git merge-base --is-ancestor "origin/$BRANCH" HEAD; then
+    if [ -n "$PIPELINE_RESULT_PATH" ]; then
+      mkdir -p "$(dirname "$PIPELINE_RESULT_PATH")"
+      printf '{"outcome":"error","error":"worktree HEAD is not a descendant of origin/%s — would require force-push (forbidden)"}' \
+        "$BRANCH" > "$PIPELINE_RESULT_PATH"
+    fi
+    exit 1
+  fi
+fi
+git push origin "$BRANCH"
 ```
 
 On commit failure: print error and EXIT (do not post marker).
@@ -257,6 +326,22 @@ Print:
   Comment posted: yes/no
   (Poller will run quality checks next, then clean up worktree and advance ticket)
 ```
+
+---
+
+## EPILOGUE — Guaranteed result-file write
+
+Before exiting for **any** reason (success, error, or unexpected branch), check that the
+result file was written. If it was written correctly by an earlier phase this is a no-op:
+
+```bash
+if [ -n "$PIPELINE_RESULT_PATH" ] && [ ! -s "$PIPELINE_RESULT_PATH" ]; then
+  mkdir -p "$(dirname "$PIPELINE_RESULT_PATH")"
+  printf '{"outcome":"error","error":"skill exited without writing result"}' > "$PIPELINE_RESULT_PATH"
+fi
+```
+
+This prevents the pipeline runner from polling for up to 1 hour on an unexpected exit.
 
 ---
 

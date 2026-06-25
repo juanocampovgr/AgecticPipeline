@@ -37,7 +37,6 @@ async def node_quality(
     context = {
         "command":       "/quality-check",
         "tools":         "Bash,Read,Grep,Glob,Edit,Write,Agent",
-        "spawn_mode":    "terminal",
         "extra_args":    mode_arg,
         "worktree_path": worktree_path,
     }

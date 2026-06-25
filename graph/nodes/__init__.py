@@ -1,5 +1,6 @@
 """Re-export all node callables for workflow.py."""
 
+from graph.nodes.recover import node_recover
 from graph.nodes.route_entry import node_route_entry
 from graph.nodes.plan import node_plan
 from graph.nodes.gate_plan_approval import gate_plan_approval
@@ -15,6 +16,7 @@ from graph.nodes.followups import node_followups
 from graph.nodes.terminals import node_done, node_needs_human, node_escalate_error
 
 __all__ = [
+    "node_recover",
     "node_route_entry",
     "node_plan",
     "gate_plan_approval",

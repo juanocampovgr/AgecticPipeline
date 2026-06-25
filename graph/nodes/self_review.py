@@ -30,7 +30,6 @@ async def node_self_review(
     context = {
         "command":    "/self-review-ticket",
         "tools":      "Bash,Read,Grep,Glob,Edit,Write,Agent",
-        "spawn_mode": "headless",
         "extra_args": "",
     }
     res = await run_stage(state, "Self Review", context)

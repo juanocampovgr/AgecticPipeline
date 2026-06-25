@@ -45,7 +45,6 @@ async def node_respond(
     context = {
         "command":       f"/respond-to-review --pr {pr_number}",
         "tools":         "Bash,Read,Grep,Glob,Edit,Write,Agent",
-        "spawn_mode":    "terminal",
         "extra_args":    "",
         "worktree_path": worktree_path,
     }

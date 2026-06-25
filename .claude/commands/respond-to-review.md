@@ -94,3 +94,16 @@ Implement requested changes from unresolved PR review comments. For each comment
 - If a comment is ambiguous, skip it rather than guessing wrong
 - Do NOT resolve the review threads yourself — the human reviewer does that
 - Do NOT approve the PR or request re-review — just push the commit and reply
+
+---
+
+## EPILOGUE — Guaranteed result-file write
+
+Before exiting for **any** reason, check that the result file was written:
+
+```bash
+if [ -n "$PIPELINE_RESULT_PATH" ] && [ ! -s "$PIPELINE_RESULT_PATH" ]; then
+  mkdir -p "$(dirname "$PIPELINE_RESULT_PATH")"
+  printf '{"outcome":"error","error":"skill exited without writing result"}' > "$PIPELINE_RESULT_PATH"
+fi
+```

@@ -44,7 +44,6 @@ async def node_fix_ci(
     context = {
         "command":       f"/fix-ci-failure --pr {pr_number}",
         "tools":         "Bash,Read,Grep,Glob,Edit,Write,Agent",
-        "spawn_mode":    "terminal",
         "extra_args":    "",
         "worktree_path": worktree_path,
     }
