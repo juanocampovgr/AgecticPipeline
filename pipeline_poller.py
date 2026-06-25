@@ -87,8 +87,13 @@ REPO_PATH_MAP: dict[str, str] = {
     "backend":              BACKEND_REPO_PATH,
 }
 
-MIN_DESCRIPTION_CHARS = int(os.environ.get("MIN_DESCRIPTION_CHARS", "20"))
-MAX_TICKET_FAILURES   = int(os.environ.get("MAX_TICKET_FAILURES", "3"))
+MIN_DESCRIPTION_CHARS    = int(os.environ.get("MIN_DESCRIPTION_CHARS", "20"))
+MAX_TICKET_FAILURES      = int(os.environ.get("MAX_TICKET_FAILURES", "3"))
+# A healthy AI-ticket branch has exactly 1 commit (impl) ahead of master; allow up to
+# 3 to accommodate a quality auto-fix commit and a respond-to-review fix.  Anything
+# beyond this is evidence of branch contamination (rebase replay, accumulated retries)
+# and the worktree must be rebuilt from origin/master instead of reused.
+MAX_SANE_COMMITS_AHEAD   = int(os.environ.get("MAX_SANE_COMMITS_AHEAD", "3"))
 
 PIPELINE_DIR  = Path(os.environ.get("PIPELINE_DIR", Path.home() / ".pipeline"))
 LOG_DIR       = Path(os.environ.get("LOG_DIR", PIPELINE_DIR / "logs"))
@@ -383,8 +388,32 @@ def _setup_worktree_sync(repo_local_path: str, ticket: int, branch_id: str = "",
             capture_output=True, text=True, check=False,
         )
         if rf.returncode == 0:
-            _log(f"  setup_worktree: remote branch '{branch}' found — using it as worktree base")
-            worktree_base = branch
+            # Sanity-check: reject the remote branch if it is suspiciously far ahead of
+            # master.  This catches contaminated branches produced by rebase-replay or
+            # accumulated multi-retry runs, and forces a clean rebuild from origin/master.
+            ahead_raw = subprocess.run(
+                ["git", "-C", repo_local_path, "rev-list", "--count", f"origin/master..{branch}"],
+                capture_output=True, text=True, check=False,
+            ).stdout.strip()
+            ahead = int(ahead_raw or 0)
+            if ahead > MAX_SANE_COMMITS_AHEAD:
+                _log(
+                    f"  setup_worktree: remote branch '{branch}' is {ahead} commits ahead of master "
+                    f"(> MAX_SANE_COMMITS_AHEAD={MAX_SANE_COMMITS_AHEAD}) — "
+                    f"branch is likely contaminated; deleting and rebuilding from {base}"
+                )
+                subprocess.run(
+                    ["git", "-C", repo_local_path, "branch", "-D", branch],
+                    capture_output=True, text=True, check=False,
+                )
+                subprocess.run(
+                    ["git", "-C", repo_local_path, "push", "origin", "--delete", branch],
+                    capture_output=True, text=True, check=False,
+                )
+                worktree_base = base
+            else:
+                _log(f"  setup_worktree: remote branch '{branch}' found ({ahead} commits ahead) — using it as worktree base")
+                worktree_base = branch
         else:
             _log(f"  setup_worktree: remote branch fetch failed (rc={rf.returncode}), falling back to {base}")
             worktree_base = base

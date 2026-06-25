@@ -19,9 +19,14 @@ import httpx
 from langgraph.types import Command
 
 from graph import events
-from graph.nodes._base import _log, move_status
+from graph.nodes._base import _log, move_status, resolve_worktree
 from graph.state import TicketState
 
+
+# Nodes that need a clean worktree to operate correctly.
+# On recovery, setup_worktree is re-run for these so a crashed subprocess
+# cannot leave a contaminated or half-written tree for the retry.
+_WORKTREE_NODES = frozenset({"implement", "quality", "self_review", "ship"})
 
 # Stage name (as written into RunRecord.stage) → graph node name.
 # Keys match the stage strings passed to `run_stage()` by every node.
@@ -90,6 +95,20 @@ async def node_recover(state: TicketState) -> Command[_RECOVER_TARGETS]:
     except Exception as e:
         _log(f"  #{ticket}: recover — board move failed: {e} (continuing)")
 
+    # For nodes that use a worktree, rebuild it from a clean state so a crashed
+    # subprocess cannot poison the retry with stale/contaminated files.
+    worktree_update: dict = {}
+    if target in _WORKTREE_NODES:
+        try:
+            worktree_path, repo_local = await resolve_worktree(state)
+            _log(f"  #{ticket}: recover — rebuilt worktree at {worktree_path}")
+            worktree_update = {
+                "impl":     {"worktree_path": worktree_path},
+                "identity": {"repo_local_path": repo_local},
+            }
+        except Exception as e:
+            _log(f"  #{ticket}: recover — worktree rebuild failed: {e} (continuing without rebuild)")
+
     events.emit(ticket, "Recovery", "stage_completed", {"resumed_at": target})
 
     return Command(
@@ -98,6 +117,7 @@ async def node_recover(state: TicketState) -> Command[_RECOVER_TARGETS]:
             "identity": {"is_recovery": False, "recovery_target": ""},
             "errors":   [f"--- recovery: resumed at '{target}' from prior failure ---"],
             "control":  {"current_stage": target},
+            **worktree_update,
         },
     )
 

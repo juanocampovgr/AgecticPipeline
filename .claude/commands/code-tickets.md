@@ -67,6 +67,13 @@ Before exploring any code, check whether the target remote branch already contai
 a previous pipeline implementation. If it does, reuse it instead of re-implementing
 from scratch — this prevents divergent-history push failures on pipeline restarts.
 
+A branch is only reused when BOTH conditions hold:
+- It is **1–3 commits** ahead of master (1 impl commit ± 1–2 auto-fix commits).
+- It touches **≤ 50 files** (a larger footprint indicates contamination from a rebase replay or accumulated multi-retry runs).
+
+If either bound is exceeded, fall through to a fresh implementation so the poller's
+`setup_worktree` (which already deleted the over-large remote branch) can provide a clean base.
+
 ```bash
 BRANCH="juanocampovgr/{ISSUE_NUMBER}"
 
@@ -75,11 +82,11 @@ if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
   # Fetch it locally so we can inspect it
   git fetch origin "$BRANCH" 2>/dev/null
 
-  # Does the remote branch have any commits ahead of master?
   AHEAD=$(git rev-list --count "origin/master..origin/$BRANCH" 2>/dev/null || echo 0)
+  FILES_TOUCHED=$(git diff --name-only "origin/master...origin/$BRANCH" 2>/dev/null | wc -l | tr -d ' ')
 
-  if [ "$AHEAD" -gt 0 ]; then
-    echo "Remote branch '$BRANCH' is $AHEAD commit(s) ahead of master — reusing it."
+  if [ "$AHEAD" -ge 1 ] && [ "$AHEAD" -le 3 ] && [ "$FILES_TOUCHED" -le 50 ]; then
+    echo "Remote branch '$BRANCH' is $AHEAD commit(s) ahead of master ($FILES_TOUCHED files) — reusing it."
 
     # Bring the worktree in sync with the remote branch tip
     git reset --hard "origin/$BRANCH"
@@ -108,11 +115,13 @@ RESULT_EOF
 <!-- ai-impl:done -->"
 
     EXIT  # Skip all remaining phases
+  else
+    echo "Remote branch '$BRANCH' failed sanity check (ahead=$AHEAD files=$FILES_TOUCHED) — skipping reuse, will implement fresh."
   fi
 fi
 ```
 
-If the branch does not exist or has no implementation commit, continue to PHASE 1.
+If the branch does not exist or fails the sanity check, continue to PHASE 1.
 
 ---
 
@@ -165,7 +174,6 @@ Launch a coding subagent with `model: "sonnet"`:
 
 ```
 You are a coding subagent. Implement the code described below.
-Do NOT run any git commands (no checkout, branch, commit, push, pull, add).
 Do NOT create a PR.
 Do NOT change any ticket/issue status.
 Work directly in the current directory (pwd) — the worktree is already configured on the correct branch.
@@ -177,7 +185,6 @@ Return a JSON result as described at the end.
 
 ## Branch
 You are already on branch `juanocampovgr/{ISSUE_NUMBER}` in a dedicated worktree.
-Do NOT create a new branch or run any git commands.
 Work directly in the current directory (pwd).
 
 ## PR 1 to implement
@@ -195,7 +202,23 @@ Title: {PR1_TITLE}
 3. Follow the exact signatures and patterns specified in the plan
 4. If a file path from the plan doesn't exist, find the closest match via Glob/Grep
 5. Add all tests listed in "Tests to add/update"
-6. Do NOT run any git commands
+
+## CRITICAL — git rules
+Allowed git invocations (read-only inspection only):
+- `git status`
+- `git diff`
+- `git log` (read-only, e.g. to understand recent changes)
+
+FORBIDDEN — do NOT run any of these under any circumstance:
+- `git checkout`, `git branch`, `git switch`
+- `git commit`, `git push`, `git pull`, `git fetch`
+- `git rebase`, `git merge`, `git cherry-pick`
+- `git reset`, `git restore`, `git stash`, `git add`
+
+If the working tree appears stale, out-of-sync with master, or has unexpected files,
+do NOT attempt to repair it with git commands. Instead return outcome=error with
+reason "worktree out of sync — needs pipeline reset". The pipeline will rebuild the
+worktree on the next attempt.
 
 ## Return
 Return this JSON:
@@ -229,9 +252,26 @@ Collect the result JSON. If subagent returned error: log and EXIT.
 git add -A
 git commit -m "feat: AI implementation for #{ISSUE_NUMBER}"
 
+BRANCH="juanocampovgr/{ISSUE_NUMBER}"
+
+# Contamination guard: refuse to push if the branch has ballooned beyond the expected
+# single-PR footprint.  This is the last line of defence — even if Phase 0b and the
+# poller's setup_worktree both missed a contaminated branch, a tainted push is still
+# prevented here.
+LOCAL_AHEAD=$(git rev-list --count "origin/master..HEAD" 2>/dev/null || echo 0)
+LOCAL_FILES=$(git diff --name-only "origin/master...HEAD" 2>/dev/null | wc -l | tr -d ' ')
+if [ "$LOCAL_AHEAD" -gt 3 ] || [ "$LOCAL_FILES" -gt 50 ]; then
+  echo "ERROR: refusing to push — branch has $LOCAL_AHEAD commits / $LOCAL_FILES files vs origin/master (contamination guard)"
+  if [ -n "$PIPELINE_RESULT_PATH" ]; then
+    mkdir -p "$(dirname "$PIPELINE_RESULT_PATH")"
+    printf '{"outcome":"error","error":"refusing to push: branch has %s commits / %s files vs origin/master (contamination guard)"}' \
+      "$LOCAL_AHEAD" "$LOCAL_FILES" > "$PIPELINE_RESULT_PATH"
+  fi
+  exit 1
+fi
+
 # Guard: if the remote branch already existed, verify HEAD is a descendant before pushing.
 # Fail fast instead of force-pushing (forbidden).
-BRANCH="juanocampovgr/{ISSUE_NUMBER}"
 if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
   if ! git merge-base --is-ancestor "origin/$BRANCH" HEAD; then
     if [ -n "$PIPELINE_RESULT_PATH" ]; then

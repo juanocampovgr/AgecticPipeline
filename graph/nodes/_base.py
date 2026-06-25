@@ -117,12 +117,6 @@ async def cleanup_worktree_if_needed(state: TicketState) -> None:
     identity = state.get("identity") or {}
     ticket = identity.get("ticket_number", 0)
     branch_id = identity.get("jira_ticket_id", "")
-
-    repo_local = impl.get("worktree_path", "")
-    # Try to get actual repo_local from impl group
-    # (stored separately if worktree was set up by node_implement)
-    from pipeline_poller import PIPELINE_DIR  # noqa: PLC0415
-    # repo_local_path is stored in identity group after resolve_worktree
     repo_local_path = identity.get("repo_local_path", "")
 
     if worktree_path and repo_local_path:
