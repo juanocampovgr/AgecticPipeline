@@ -230,17 +230,35 @@ async def node_recover(state: TicketState, store=None) -> Command[_RECOVER_TARGE
     # For nodes that use a worktree, rebuild it from a clean state so a crashed
     # subprocess cannot poison the retry with stale/contaminated files.
     # monitor_pr is a gate node — it never writes files, no worktree needed.
+    #
+    # Stages that run after implementation (quality, self_review, ship) require the
+    # remote branch to exist.  If it doesn't, the implementation push failed — falling
+    # back to master would produce a ghost-success.  Escalate to needs_human instead.
+    _POST_IMPL_NODES = frozenset({"quality", "self_review", "ship"})
     worktree_update: dict = {}
     if target in _WORKTREE_NODES:
         try:
-            worktree_path, repo_local = await resolve_worktree(state, store)
+            needs_remote = target in _POST_IMPL_NODES
+            worktree_path, repo_local = await resolve_worktree(state, store, require_remote_branch=needs_remote)
             _log(f"  #{ticket}: recover — rebuilt worktree at {worktree_path}")
             worktree_update = {
                 "impl":     {"worktree_path": worktree_path},
                 "identity": {"repo_local_path": repo_local},
             }
         except Exception as e:
-            _log(f"  #{ticket}: recover — worktree rebuild failed: {e} (continuing without rebuild)")
+            _log(f"  #{ticket}: recover — worktree rebuild failed: {e}")
+            if target in _POST_IMPL_NODES:
+                # Branch is missing at remote — implementation push failed.
+                # Escalate to needs_human so the human can reset to AI Implementation.
+                events.emit(ticket, "Recovery", "stage_completed", {"resumed_at": "needs_human"})
+                return Command(
+                    goto="needs_human",
+                    update={
+                        "identity": {"is_recovery": False, "recovery_target": ""},
+                        "errors":   [f"--- recovery: worktree rebuild failed for '{target}' ---", str(e)],
+                    },
+                )
+            _log(f"  #{ticket}: recover — continuing without worktree rebuild")
 
     events.emit(ticket, "Recovery", "stage_completed", {"resumed_at": target})
 

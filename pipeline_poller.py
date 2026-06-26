@@ -352,7 +352,7 @@ async def _escalate_to_error(client: httpx.AsyncClient, item: dict, reason: str)
     _log(f"  #{ticket}: escalated to Error — {reason[:80]}")
 
 
-def _setup_worktree_sync(repo_local_path: str, ticket: int, branch_id: str = "", base: str = "origin/master") -> str:
+def _setup_worktree_sync(repo_local_path: str, ticket: int, branch_id: str = "", base: str = "origin/master", require_remote_branch: bool = False) -> str:
     branch = f"juanocampovgr/{branch_id or ticket}"
     worktree_path = str(WORKTREES_DIR / str(ticket))
 
@@ -419,6 +419,11 @@ def _setup_worktree_sync(repo_local_path: str, ticket: int, branch_id: str = "",
             _log(f"  setup_worktree: remote branch fetch failed (rc={rf.returncode}), falling back to {base}")
             worktree_base = base
     else:
+        if require_remote_branch:
+            raise RuntimeError(
+                f"Branch '{branch}' not found at remote origin. "
+                "The implementation push likely failed. Reset ticket to AI Implementation to re-run the code agent."
+            )
         worktree_base = base
 
     current = subprocess.run(
@@ -484,10 +489,10 @@ def _cleanup_worktree_sync(worktree_path: str, repo_local_path: str, ticket: int
     )
 
 
-async def setup_worktree(repo_local_path: str, ticket: int, branch_id: str = "", base: str = "origin/master") -> str:
+async def setup_worktree(repo_local_path: str, ticket: int, branch_id: str = "", base: str = "origin/master", require_remote_branch: bool = False) -> str:
     """Async wrapper — runs git operations in a thread so the event loop stays free."""
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, _setup_worktree_sync, repo_local_path, ticket, branch_id, base)
+    return await loop.run_in_executor(None, _setup_worktree_sync, repo_local_path, ticket, branch_id, base, require_remote_branch)
 
 
 async def cleanup_worktree(worktree_path: str, repo_local_path: str, ticket: int, branch_id: str = "") -> None:

@@ -87,7 +87,7 @@ async def resolve_repo_local(state: TicketState, store) -> str:
 
 
 async def resolve_worktree(
-    state: TicketState, store, *, base: str = "origin/master"
+    state: TicketState, store, *, base: str = "origin/master", require_remote_branch: bool = False
 ) -> tuple[str, str]:
     """Return (worktree_path, repo_local_path). Raises RuntimeError if repo unknown."""
     from pipeline_poller import (  # noqa: PLC0415
@@ -106,7 +106,7 @@ async def resolve_worktree(
         )
 
     async with _get_repo_semaphore(repo):
-        worktree_path = await setup_worktree(repo_local, ticket, branch_id, base)
+        worktree_path = await setup_worktree(repo_local, ticket, branch_id, base, require_remote_branch)
     return worktree_path, repo_local
 
 

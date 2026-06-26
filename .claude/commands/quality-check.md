@@ -98,6 +98,22 @@ If push fails: run INFRASTRUCTURE FAILURE PROCEDURE and EXIT. Runners need the r
 
 ---
 
+## PHASE 2.5 — Verify branch has implementation changes
+
+After pushing, confirm the branch actually differs from `origin/master`. A worktree created when the implementation branch was missing will be based on master and have zero changes — this must be caught before dispatching CI.
+
+```bash
+CHANGED_FILES=$(git diff --name-only origin/master | wc -l | tr -d ' ')
+if [ "$CHANGED_FILES" -eq 0 ]; then
+  ERROR_DESCRIPTION="Branch '$BRANCH' has no changes vs origin/master — the implementation push likely failed or the worktree was built from master. Reset ticket to AI Implementation to re-run the code agent."
+  call ERROR REPORTING PROCEDURE with ERROR_DESCRIPTION and EXIT
+fi
+```
+
+If CHANGED_FILES is 0: run ERROR REPORTING PROCEDURE (with stage "verify-branch-has-changes") and EXIT.
+
+---
+
 ## PHASE 3 — Dispatch and watch workflows
 
 **Step 1 — Dispatch all three workflows:**
