@@ -60,6 +60,33 @@ def find_pipeline_claude_pids_for_ticket(ticket: int) -> list[int]:
     return pids
 
 
+def find_poller_pid() -> int | None:
+    """Return the PID of a live pipeline_poller.py process, or None.
+
+    Catches manually-launched pollers that launchd doesn't know about.
+    """
+    result = subprocess.run(
+        ["pgrep", "-fl", "pipeline_poller.py"],
+        capture_output=True, text=True,
+    )
+    own_pid = os.getpid()
+    for line in result.stdout.strip().splitlines():
+        line = line.strip()
+        if not line or "pgrep" in line:
+            continue
+        parts = line.split(None, 1)
+        if len(parts) < 2:
+            continue
+        try:
+            pid = int(parts[0])
+        except ValueError:
+            continue
+        if pid == own_pid:
+            continue
+        return pid
+    return None
+
+
 def kill_pids(pids: list[int], *, grace_seconds: float = 3.0, log=print) -> None:
     """SIGTERM all → wait grace_seconds → SIGKILL survivors."""
     if not pids:

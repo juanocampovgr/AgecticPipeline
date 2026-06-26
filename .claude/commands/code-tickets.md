@@ -13,15 +13,20 @@ up the worktree and advances the ticket.
 On any unrecoverable failure: post a `<!-- ai-impl:error -->` comment on the issue — the
 poller detects this marker and moves the ticket to the **Error** column for human resolution.
 
-**NEVER create a PR. NEVER change ticket status. NEVER run `git checkout` or `git branch`.**
+**Never create a PR. Never change ticket status. Never run `git checkout` or `git branch`.**
 
 ---
 
 ## ERROR REPORTING PROCEDURE
 
-Call this on **every** unrecoverable failure before EXIT:
+Call this on every unrecoverable failure. It writes the result file and posts the error
+comment — do not double-write or double-post after calling it.
 
 ```bash
+if [ -n "$PIPELINE_RESULT_PATH" ]; then
+  mkdir -p "$(dirname "$PIPELINE_RESULT_PATH")"
+  printf '{"outcome":"error","error":"%s"}' "{ERROR_DESCRIPTION}" > "$PIPELINE_RESULT_PATH"
+fi
 gh issue comment {ISSUE_NUMBER} \
   --repo {ISSUE_REPO_FULL} \
   --body "⚠️ **Implementation failed — {STAGE}**
@@ -33,9 +38,6 @@ The ticket has been moved to **Error** for human review. Fix the issue and move 
 
 <!-- ai-impl:error -->"
 ```
-
-The `<!-- ai-impl:error -->` marker tells the poller to move the ticket to the Error column on
-its next poll cycle.
 
 ---
 
@@ -50,13 +52,9 @@ ios_repo     = IOS_REPO      (local path)
 backend_repo = BACKEND_REPO  (local path)
 ```
 
-Derive GitHub org/owner from git remotes when posting comments:
-- `android_github_org` = from `git -C {android_repo} remote get-url origin`
-- Same for ios and backend
-
 Parse `$ARGUMENTS`:
-- `--ticket <N>` → single ticket mode (required when called by poller)
-- `--dry-run`    → print what would happen, skip checks/commit/push, post nothing
+- `--ticket <N>` → required; identifies the GitHub issue
+- `--dry-run`    → print what would be implemented, skip execution, post nothing
 - `--repo <name>` → restrict to this repo (e.g. "grindr-android")
 
 ---
@@ -93,7 +91,7 @@ if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
 
     HEAD_SHA=$(git rev-parse HEAD)
 
-    # Write a success result file so the pipeline can advance immediately
+    # Write result file so the pipeline can advance immediately
     if [ -n "$PIPELINE_RESULT_PATH" ]; then
       mkdir -p "$(dirname "$PIPELINE_RESULT_PATH")"
       cat > "$PIPELINE_RESULT_PATH" << RESULT_EOF
@@ -107,14 +105,13 @@ if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
 RESULT_EOF
     fi
 
-    # Post the done marker so the poller can detect completion via comment too
     gh issue comment {ISSUE_NUMBER} \
       --repo {ISSUE_REPO_FULL} \
       --body "**Implementation reused — existing branch** \`$BRANCH\` already contains a valid implementation commit (\`$HEAD_SHA\`). Advancing to quality check.
 
 <!-- ai-impl:done -->"
 
-    EXIT  # Skip all remaining phases
+    exit 0  # Skip all remaining phases
   else
     echo "Remote branch '$BRANCH' failed sanity check (ahead=$AHEAD files=$FILES_TOUCHED) — skipping reuse, will implement fresh."
   fi
@@ -127,7 +124,7 @@ If the branch does not exist or fails the sanity check, continue to PHASE 1.
 
 ## PHASE 1 — Find the ticket
 
-If `--ticket N` passed: scan all three repos for the issue:
+Scan all three repos for the issue:
 ```bash
 gh issue view {N} --repo {org}/{repo} --json number,title,labels,comments 2>/dev/null
 ```
@@ -138,7 +135,7 @@ Build:
 ticket = { issue_number, issue_repo_full (org/repo), repo_name, title, comments }
 ```
 
-If no ticket found: print "Ticket #{N} not found in any configured repo." EXIT.
+If no ticket found: print "Ticket #{N} not found in any configured repo." and EXIT.
 
 ---
 
@@ -159,7 +156,7 @@ plan_pr1 = {
 }
 ```
 
-If no Implementation Plan comment found: print error and EXIT.
+If no Implementation Plan comment found: call ERROR REPORTING PROCEDURE (stage: "extract plan") and EXIT.
 
 ---
 
@@ -167,6 +164,8 @@ If no Implementation Plan comment found: print error and EXIT.
 
 **Context:** The poller has already created a git worktree and opened this Terminal session in it.
 You are already on branch `juanocampovgr/{ISSUE_NUMBER}`. Work in `pwd` (the current directory).
+
+If `--dry-run`: print what would be implemented and EXIT without running the subagent or any subsequent phases.
 
 Launch a coding subagent with `model: "sonnet"`:
 
@@ -203,22 +202,17 @@ Title: {PR1_TITLE}
 4. If a file path from the plan doesn't exist, find the closest match via Glob/Grep
 5. Add all tests listed in "Tests to add/update"
 
-## CRITICAL — git rules
-Allowed git invocations (read-only inspection only):
-- `git status`
-- `git diff`
-- `git log` (read-only, e.g. to understand recent changes)
+## Git rules
+Only use git for read-only inspection:
+- `git status`, `git diff`, `git log`
 
-FORBIDDEN — do NOT run any of these under any circumstance:
-- `git checkout`, `git branch`, `git switch`
-- `git commit`, `git push`, `git pull`, `git fetch`
-- `git rebase`, `git merge`, `git cherry-pick`
-- `git reset`, `git restore`, `git stash`, `git add`
+Do not stage, commit, push, branch, reset, or otherwise mutate git state. The parent
+skill owns all git operations — if you touch git state, you risk corrupting the worktree
+in a way the pipeline cannot recover from without a full reset.
 
 If the working tree appears stale, out-of-sync with master, or has unexpected files,
-do NOT attempt to repair it with git commands. Instead return outcome=error with
-reason "worktree out of sync — needs pipeline reset". The pipeline will rebuild the
-worktree on the next attempt.
+do NOT attempt to repair it. Instead return outcome=error with reason
+"worktree out of sync — needs pipeline reset".
 
 ## Return
 Return this JSON:
@@ -240,53 +234,74 @@ On failure:
 }
 ```
 
-If dry_run == true: print what would be implemented, skip the subagent and all subsequent phases, EXIT.
-
-Collect the result JSON. If subagent returned error: log and EXIT.
+Collect the result JSON. If the subagent returned a non-null `error`: call ERROR REPORTING
+PROCEDURE (stage: "implementation", error: subagent's error message) and EXIT.
 
 ---
 
-## PHASE 4 — Commit and push
+## PHASE 4 — Commit, push, and write pipeline result
 
+**Step 1 — Commit:**
 ```bash
 git add -A
 git commit -m "feat: AI implementation for #{ISSUE_NUMBER}"
+```
 
-BRANCH="juanocampovgr/{ISSUE_NUMBER}"
+On commit failure: call ERROR REPORTING PROCEDURE (stage: "commit") and EXIT.
 
-# Contamination guard: refuse to push if the branch has ballooned beyond the expected
-# single-PR footprint.  This is the last line of defence — even if Phase 0b and the
-# poller's setup_worktree both missed a contaminated branch, a tainted push is still
-# prevented here.
+**Step 2 — Contamination guard:**
+
+Refuse to push if the branch has grown beyond the expected single-PR footprint. This is the
+last line of defence — even if Phase 0b and the poller's `setup_worktree` both missed a
+contaminated branch, a tainted push is still prevented here.
+
+```bash
 LOCAL_AHEAD=$(git rev-list --count "origin/master..HEAD" 2>/dev/null || echo 0)
 LOCAL_FILES=$(git diff --name-only "origin/master...HEAD" 2>/dev/null | wc -l | tr -d ' ')
 if [ "$LOCAL_AHEAD" -gt 3 ] || [ "$LOCAL_FILES" -gt 50 ]; then
   echo "ERROR: refusing to push — branch has $LOCAL_AHEAD commits / $LOCAL_FILES files vs origin/master (contamination guard)"
-  if [ -n "$PIPELINE_RESULT_PATH" ]; then
-    mkdir -p "$(dirname "$PIPELINE_RESULT_PATH")"
-    printf '{"outcome":"error","error":"refusing to push: branch has %s commits / %s files vs origin/master (contamination guard)"}' \
-      "$LOCAL_AHEAD" "$LOCAL_FILES" > "$PIPELINE_RESULT_PATH"
-  fi
-  exit 1
+  # Call ERROR REPORTING PROCEDURE with this message, then EXIT
 fi
+```
 
-# Guard: if the remote branch already existed, verify HEAD is a descendant before pushing.
-# Fail fast instead of force-pushing (forbidden).
+**Step 3 — Descendant guard:**
+
+If the remote branch already existed, verify HEAD is a descendant before pushing.
+Fail fast instead of force-pushing (which is forbidden).
+
+```bash
+BRANCH="juanocampovgr/{ISSUE_NUMBER}"
 if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
   if ! git merge-base --is-ancestor "origin/$BRANCH" HEAD; then
-    if [ -n "$PIPELINE_RESULT_PATH" ]; then
-      mkdir -p "$(dirname "$PIPELINE_RESULT_PATH")"
-      printf '{"outcome":"error","error":"worktree HEAD is not a descendant of origin/%s — would require force-push (forbidden)"}' \
-        "$BRANCH" > "$PIPELINE_RESULT_PATH"
-    fi
-    exit 1
+    # Call ERROR REPORTING PROCEDURE: "worktree HEAD is not a descendant of origin/{BRANCH} — needs pipeline reset"
+    # EXIT
   fi
 fi
+```
+
+**Step 4 — Push:**
+```bash
 git push origin "$BRANCH"
 ```
 
-On commit failure: print error and EXIT (do not post marker).
-On push failure: print error and EXIT (do not post marker).
+On push failure: call ERROR REPORTING PROCEDURE (stage: "push") and EXIT.
+
+**Step 5 — Write pipeline result:**
+
+```bash
+if [ -n "$PIPELINE_RESULT_PATH" ]; then
+  mkdir -p "$(dirname "$PIPELINE_RESULT_PATH")"
+  cat > "$PIPELINE_RESULT_PATH" << RESULT_EOF
+{
+  "outcome": "done",
+  "branch": "juanocampovgr/{ISSUE_NUMBER}",
+  "files_changed": {FILES_CHANGED_JSON_ARRAY},
+  "impl_summary": "{PR1_TITLE}",
+  "commit_shas": {COMMIT_SHAS_JSON_ARRAY}
+}
+RESULT_EOF
+fi
+```
 
 Build the compare URL:
 ```
@@ -295,62 +310,21 @@ compare_url = https://github.com/{ISSUE_REPO_FULL}/compare/master...juanocampovg
 
 ---
 
-## PHASE 4b — Write Pipeline Result
-
-Before posting the `<!-- ai-impl:done -->` marker, write a structured result file so the
-pipeline graph node can read the outcome without waiting for a GitHub comment:
-
-```bash
-if [ -n "$PIPELINE_RESULT_PATH" ]; then
-  mkdir -p "$(dirname "$PIPELINE_RESULT_PATH")"
-  # Replace placeholders with actual values
-  cat > "$PIPELINE_RESULT_PATH" << RESULT_EOF
-{
-  "outcome": "done",
-  "branch": "juanocampovgr/{ISSUE_NUMBER}",
-  "files_changed": {FILES_CHANGED_JSON_ARRAY},
-  "impl_summary": "Implementation complete for #{ISSUE_NUMBER}",
-  "commit_shas": {COMMIT_SHAS_JSON_ARRAY}
-}
-RESULT_EOF
-fi
-```
-
-On **any error path** (wherever you would post `<!-- ai-impl:error -->`), write first:
-
-```bash
-if [ -n "$PIPELINE_RESULT_PATH" ]; then
-  mkdir -p "$(dirname "$PIPELINE_RESULT_PATH")"
-  printf '{"outcome":"error","error":"%s"}' "{ERROR_DESCRIPTION}" > "$PIPELINE_RESULT_PATH"
-fi
-```
-
-`$PIPELINE_RESULT_PATH` is set by the pipeline runner. If the variable is unset the skill runs
-in standalone mode — the write is skipped and only the marker comment is used.
-
----
-
 ## PHASE 5 — Post implementation marker comment
-
-Post to the issue with **exactly** this body (substitute values):
-
-```markdown
-**Implementation complete — branch pushed**
-
-- **Branch:** `juanocampovgr/{ISSUE_NUMBER}`
-- **Files changed:** {N} files
-- **Compare vs master:** {compare_url}
-
-<!-- ai-impl:done -->
-```
 
 ```bash
 gh issue comment {ISSUE_NUMBER} \
   --repo {ISSUE_REPO_FULL} \
-  --body "{comment_body}"
+  --body "**Implementation complete — branch pushed**
+
+- **Branch:** \`juanocampovgr/{ISSUE_NUMBER}\`
+- **Files changed:** {N} files
+- **Compare vs master:** {compare_url}
+
+<!-- ai-impl:done -->"
 ```
 
-On failure: log error. The poller will not advance the ticket (marker absent), which is correct.
+On failure: log the error. The poller will not advance the ticket (marker absent), which is correct.
 
 ---
 
@@ -371,8 +345,8 @@ Print:
 
 ## EPILOGUE — Guaranteed result-file write
 
-Before exiting for **any** reason (success, error, or unexpected branch), check that the
-result file was written. If it was written correctly by an earlier phase this is a no-op:
+Before exiting for any reason, ensure the result file was written. This is a safety net for
+unexpected exits — the procedures above should have already written it.
 
 ```bash
 if [ -n "$PIPELINE_RESULT_PATH" ] && [ ! -s "$PIPELINE_RESULT_PATH" ]; then
@@ -381,25 +355,18 @@ if [ -n "$PIPELINE_RESULT_PATH" ] && [ ! -s "$PIPELINE_RESULT_PATH" ]; then
 fi
 ```
 
-This prevents the pipeline runner from polling for up to 1 hour on an unexpected exit.
-
 ---
 
 ## ERROR HANDLING
 
-All unrecoverable failures follow the same pattern:
-1. Run the **ERROR REPORTING PROCEDURE** (post `<!-- ai-impl:error -->` comment)
-2. EXIT
-
-The poller detects the error marker on the next poll and moves the ticket to **Error**.
-
 | Scenario | Action |
 |---|---|
-| Ticket not found | EXIT with message (no comment — issue unknown) |
-| No Implementation Plan comment | Run error procedure, EXIT |
-| Subagent returns error | Run error procedure, EXIT |
-| git commit fails | Run error procedure, EXIT |
-| git push fails | Run error procedure, EXIT |
+| Ticket not found | Print message and EXIT (no comment — issue unknown) |
+| No Implementation Plan comment | Call ERROR REPORTING PROCEDURE, EXIT |
+| Subagent returns error | Call ERROR REPORTING PROCEDURE, EXIT |
+| git commit fails | Call ERROR REPORTING PROCEDURE, EXIT |
+| Contamination guard triggered | Call ERROR REPORTING PROCEDURE, EXIT |
+| Descendant guard triggered | Call ERROR REPORTING PROCEDURE, EXIT |
+| git push fails | Call ERROR REPORTING PROCEDURE, EXIT |
 | Error comment post fails | Log and EXIT — poller staleness watchdog will flag it |
 | gh 401 auth error | Print `gh auth refresh -s repo`. EXIT. |
-

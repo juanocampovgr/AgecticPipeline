@@ -21,6 +21,7 @@ Poller's three jobs (v2 refactor):
 """
 
 import asyncio
+import fcntl
 import os
 import re
 import shutil
@@ -859,12 +860,26 @@ async def reconcile_once(workflow) -> None:
 
             # ── Not at interrupt — check if we need to restart ─────────────
             if graph_snapshot.next and thread_id not in _active_threads:
-                # Restart recovery: thread has pending work but no live task in this
-                # process (poller restarted). Pass None — LangGraph resumes from last
-                # checkpoint; run_stage() idempotency handles re-launch vs read.
-                _log(f"    #{ticket}: restart recovery — resuming from checkpoint")
+                # Restart recovery: thread has pending work but no live task.
+                # Clear the checkpoint and re-enter at node_recover so all
+                # recovery logic (orphan cleanup, worktree rebuild, board move)
+                # is handled in one place rather than relying on LangGraph to
+                # resume from a potentially stale snapshot.next.
+                prev_values = graph_snapshot.values or {}
+                recovery_state = {
+                    **prev_values,
+                    "identity": {
+                        **(prev_values.get("identity") or {}),
+                        "is_recovery": True,
+                        # No explicit recovery_target — node_recover infers
+                        # the resume point from result files on disk.
+                    },
+                }
+                await _clear_checkpoint(thread_id)
+                _log(f"    #{ticket}: restart recovery — re-entering at node_recover")
                 _open_dashboard(item, status=status)
-                asyncio.create_task(_run_thread(workflow, thread_id, None))
+                graph_events.emit(ticket, None, "status_changed", {"status": "resuming"})
+                asyncio.create_task(_run_thread(workflow, thread_id, recovery_state))
             elif graph_snapshot.next:
                 _log(f"    #{ticket}: node running in this process — skip")
             elif status == "Ready To Pick Up":
@@ -899,38 +914,53 @@ async def reconcile_once(workflow) -> None:
 
 # ── Main entry point ──────────────────────────────────────────────────────────
 
-_PID_FILE = PIPELINE_DIR / "poller.pid"
+_LOCK_FILE = PIPELINE_DIR / "poller.lock"
+_lock_fd: int | None = None  # kept open for the process lifetime; closing releases the flock
 
 
 def _acquire_pid_lock() -> bool:
-    """Write our PID to the lock file. Return False if another instance is running."""
-    if _PID_FILE.exists():
+    """Acquire an exclusive flock on poller.lock. Return False if another instance holds it.
+
+    Uses fcntl.flock (kernel-enforced, atomic, auto-released on death/SIGKILL) instead of
+    a check-then-write PID file, which had a TOCTOU race and PID-reuse false positives.
+    On rejection, exits 0 so launchd (KeepAlive=SuccessfulExit:false) does not relaunch.
+    """
+    global _lock_fd
+    PIPELINE_DIR.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(_LOCK_FILE), os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (BlockingIOError, OSError):
         try:
-            other_pid = int(_PID_FILE.read_text().strip())
-            # Check if that process is actually alive
-            import subprocess as _sp
-            result = _sp.run(["kill", "-0", str(other_pid)], capture_output=True)
-            if result.returncode == 0:
-                _log(f"ERROR: another poller is already running (pid {other_pid}) — exiting")
-                return False
+            other_pid = os.read(fd, 32).decode().strip()
         except Exception:
-            pass  # stale file — safe to overwrite
-    _PID_FILE.write_text(str(os.getpid()))
+            other_pid = "unknown"
+        _log(f"ERROR: another poller is already running (pid {other_pid}) — exiting")
+        os.close(fd)
+        return False
+    # Lock acquired — record our PID for human inspection
+    os.ftruncate(fd, 0)
+    os.lseek(fd, 0, os.SEEK_SET)
+    os.write(fd, str(os.getpid()).encode())
+    _lock_fd = fd
     return True
 
 
 def _release_pid_lock() -> None:
-    try:
-        if _PID_FILE.exists() and _PID_FILE.read_text().strip() == str(os.getpid()):
-            _PID_FILE.unlink()
-    except Exception:
-        pass
+    global _lock_fd
+    if _lock_fd is not None:
+        try:
+            fcntl.flock(_lock_fd, fcntl.LOCK_UN)
+            os.close(_lock_fd)
+        except Exception:
+            pass
+        _lock_fd = None
 
 
 async def main():
     _validate_config()
     if not _acquire_pid_lock():
-        sys.exit(1)
+        sys.exit(0)  # clean exit so launchd (KeepAlive=SuccessfulExit:false) does not relaunch
     _log("=== pipeline-poller starting (LangGraph edition) ===")
     _log(f"  project:   #{PROJECT_NUMBER} owner={PROJECT_OWNER}")
     _log(f"  claude:    {CLAUDE_BIN}")
@@ -947,6 +977,14 @@ async def main():
     async with AsyncSqliteSaver.from_conn_string(str(GRAPH_DB_PATH)) as checkpointer:
         workflow = build_workflow(checkpointer)
         _log("  LangGraph workflow compiled and ready")
+
+        # Kill any claude subprocesses left over from a prior poller run so they
+        # don't race the resumed runs for the same result files.
+        import process_utils as _pu
+        _orphan_pids = [p for p, _ in _pu.find_pipeline_claude_pids()]
+        if _orphan_pids:
+            _log(f"  startup: killing {len(_orphan_pids)} orphaned claude process(es): {_orphan_pids}")
+            _pu.kill_pids(_orphan_pids, grace_seconds=2.0, log=_log)
 
         loop = asyncio.get_running_loop()
         stop_event = asyncio.Event()

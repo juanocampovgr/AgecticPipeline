@@ -1,55 +1,104 @@
-Ship a ticket's verified implementation branch by creating a draft PR. The branch is already verified by the AgecticPipeline (quality-check + self-review passed before human approval); this skill ONLY pushes the branch and creates the PR.
+# ship-agentic-ticket
+
+Ships a ticket's verified implementation branch by creating a draft PR. The branch has already
+passed quality-check and self-review — this skill only creates the PR and posts the done marker.
 
 Post `<!-- ai-ship:done -->` on success or `<!-- ai-ship:error -->` on unrecoverable failure.
 
-## ABSOLUTE PROHIBITIONS
-
-This skill is the LAST step before opening the PR. The branch is already verified. You MUST NOT run:
-
-- `./gradlew` (any task — lint, test, build, assemble, check, install)
-- `mvn`, `npm test`, `pytest`, or any other build/test tool
-- `gh pr checks` or anything that waits on CI
-- `git checkout`, `git branch`, `git rebase`, `git merge`, `git reset`
-- Any command that takes longer than ~10 seconds
-
-If you find yourself about to run a build/test command, STOP — write `{"outcome":"error","error":"ship-agentic-ticket attempted forbidden build/test command"}` to `$PIPELINE_RESULT_PATH`, post `<!-- ai-ship:error -->`, and exit.
-
 Expected total runtime: under 90 seconds.
 
-## Arguments
+## Usage
 `/ship-agentic-ticket --ticket <N>`
 
-## Steps
+---
 
-### 1. Parse args
-Extract `--ticket N` from `$ARGUMENTS`. Determine `ISSUE_REPO_FULL` (e.g. `juanocampovgr/AgecticPipeline`) from the ticket — the pipeline node sets cwd to a worktree of the implementation repo (e.g. `grindrllc/grindr-android`), but the issue lives in the project repo.
+## ERROR REPORTING PROCEDURE
 
-### 2. Ensure branch is pushed (safety net — quality-check already pushed)
+Call this on every unrecoverable failure. It writes the result file and posts the error
+comment — do not double-write or double-post after calling it.
+
+```bash
+if [ -n "$PIPELINE_RESULT_PATH" ]; then
+  mkdir -p "$(dirname "$PIPELINE_RESULT_PATH")"
+  printf '{"outcome":"error","error":"%s"}' "{ERROR_DESCRIPTION}" > "$PIPELINE_RESULT_PATH"
+fi
+gh issue comment {ISSUE_NUMBER} \
+  --repo {ISSUE_REPO_FULL} \
+  --body "⚠️ **Ship failed — {STAGE}**
+
+**Error:** {ERROR_DESCRIPTION}
+**Time:** $(date '+%Y-%m-%d %H:%M:%S')
+
+<!-- ai-ship:error -->"
+```
+
+---
+
+## PHASE 0 — Bootstrap
+
+Read `~/.claude/skills/plan-github-tickets/config.md` and parse every KEY=VALUE line:
+
+```
+owner        = GITHUB_OWNER
+project_repo = PROJECT_REPO   (e.g. juanocampovgr/AgecticPipeline — where issues live)
+android_repo = ANDROID_REPO   (local path to implementation repo)
+```
+
+Parse `$ARGUMENTS`:
+- `--ticket <N>` → required
+
+Derive:
+- `ISSUE_REPO_FULL` = value of `project_repo` from config (this is the repo where GitHub issues live, distinct from the implementation repo the worktree is in)
+- `BRANCH` = `git rev-parse --abbrev-ref HEAD` (the current worktree branch)
+
+---
+
+## PHASE 1 — Safety-net push
+
+The branch should already be pushed by quality-check. This guards against edge cases where
+the previous step's push did not complete:
+
 ```bash
 git push -u origin HEAD
 ```
-On failure → write `{"outcome":"error","error":"<message>"}` to `$PIPELINE_RESULT_PATH`, post `<!-- ai-ship:error -->`, EXIT.
 
-### 3. Fetch issue context
+On failure: call ERROR REPORTING PROCEDURE (stage: "push") and EXIT.
+
+---
+
+## PHASE 2 — Fetch issue context
+
 ```bash
-gh issue view <N> --repo <ISSUE_REPO_FULL> --json title,body,comments
+gh issue view {ISSUE_NUMBER} --repo {ISSUE_REPO_FULL} --json title,body,comments
 ```
+
 Extract:
-- `title` — the issue title
-- `plan_comment` — the most recent comment containing `## Implementation Plan`
+- `ISSUE_TITLE` — the issue title
+- `PLAN_COMMENT` — body of the most recent comment containing `## Implementation Plan`
 
-### 4. Generate PR description via `/grindr-pr-description`
+If the issue is not found: call ERROR REPORTING PROCEDURE (stage: "fetch issue") and EXIT.
 
-Invoke the `/grindr-pr-description` skill (resolved from the android worktree at `.claude/commands/grindr-pr-description.md`). Pass it the issue number, title, body, and plan comment as context. Store the rendered markdown body in shell variable `PR_BODY`.
+---
 
-If `/grindr-pr-description` fails or takes too long (>30s), fall back to a minimal inline body:
+## PHASE 3 — Generate PR description
+
+Check if `.claude/commands/grindr-pr-description.md` exists in the current worktree:
+
+```bash
+test -f .claude/commands/grindr-pr-description.md
+```
+
+If it exists, read it and follow its instructions to generate a PR body from the issue
+context (title, body, plan comment). Store the result in `PR_BODY`.
+
+If the file does not exist or generation fails, use this fallback:
 
 ```
 ## Description
-<JIRA ticket from branch name> — <2-3 sentence summary from issue title>
+{JIRA_TICKET_FROM_BRANCH_NAME} — {2-3 sentence summary from issue title and body}
 
 ## Implementation Plan
-<copy `## Implementation Plan` section from plan_comment, trimmed>
+{PLAN_COMMENT content, trimmed to the first 3000 characters}
 
 ## Test Plan
 Verified by AgecticPipeline quality-check (detekt, lint, unit tests passed).
@@ -57,7 +106,13 @@ Verified by AgecticPipeline quality-check (detekt, lint, unit tests passed).
 🤖 Generated by AgecticPipeline
 ```
 
-### 5. Write Pipeline Result (before creating PR)
+---
+
+## PHASE 4 — Reserve result slot
+
+Write a placeholder result *before* creating the PR. If the PR creation partially succeeds
+(e.g. the API call times out but GitHub still created the PR), this ensures the pipeline
+graph node sees `outcome: done` rather than a missing file and does not declare a crash:
 
 ```bash
 if [ -n "$PIPELINE_RESULT_PATH" ]; then
@@ -66,25 +121,35 @@ if [ -n "$PIPELINE_RESULT_PATH" ]; then
 fi
 ```
 
-Written BEFORE PR creation so a mid-creation failure still unblocks the graph (Layer D won't declare crash).
+Phase 6 overwrites this with the real PR number and URL once confirmed.
 
-### 6. Create draft PR
+---
 
-Determine the correct base branch from the worktree's remote (`grindrllc/grindr-android` uses `master`; other repos may use `main`):
+## PHASE 5 — Create draft PR
+
+Determine the base branch and build the PR title:
 
 ```bash
 BASE=$(git remote show origin | awk '/HEAD branch/ {print $NF}')
-PR_TITLE="[Ticket-<N>] <friendly description derived from issue title>"
-gh pr create --draft --base "$BASE" \
-  --title "$PR_TITLE" \
-  --body "$PR_BODY"
+PR_TITLE="[Ticket-{ISSUE_NUMBER}] {FRIENDLY_DESCRIPTION_FROM_ISSUE_TITLE}"
 ```
 
-Capture `PR_URL` from the gh output, derive `PR_NUMBER` from the URL.
+Create the PR:
 
-On failure → overwrite result with `{"outcome":"error","error":"<message>"}`, post `<!-- ai-ship:error -->`, EXIT.
+```bash
+PR_URL=$(gh pr create --draft --base "$BASE" \
+  --title "$PR_TITLE" \
+  --body "$PR_BODY")
+PR_NUMBER=$(echo "$PR_URL" | grep -oE '[0-9]+$')
+```
 
-### 7. Update Pipeline Result with PR details
+On failure: call ERROR REPORTING PROCEDURE (stage: "create PR") and EXIT.
+
+---
+
+## PHASE 6 — Update result and post done marker
+
+Overwrite the placeholder with the confirmed PR details:
 
 ```bash
 if [ -n "$PIPELINE_RESULT_PATH" ]; then
@@ -98,28 +163,30 @@ RESULT_EOF
 fi
 ```
 
-### 8. Post done marker
-
-Print success to stdout first (so runner's Layer D log-recovery can detect it):
+Print to stdout (runner log-recovery can detect completion from here if the comment fails):
 
 ```bash
 echo "Ship complete — PR #${PR_NUMBER} created at ${PR_URL}"
 ```
 
-Then post the issue comment:
+Post the done marker:
 
 ```bash
-gh issue comment <N> --repo <ISSUE_REPO_FULL> --body "$(cat <<'EOF'
-✅ **Ship complete** — PR created: ${PR_URL}
+gh issue comment {ISSUE_NUMBER} --repo {ISSUE_REPO_FULL} \
+  --body "✅ **Ship complete** — PR created: ${PR_URL}
 
-<!-- ai-ship:done -->
-EOF
-)"
+<!-- ai-ship:done -->"
 ```
+
+On comment post failure: log the error. The poller will not advance (marker absent), which
+is correct — better to stall than to silently advance without a trackable PR link.
+
+---
 
 ## EPILOGUE — Guaranteed result-file write
 
-Before exiting for **any** reason, check that the result file was written:
+Before exiting for any reason, ensure the result file was written. This is a safety net for
+unexpected exits — the procedures above should have already written it.
 
 ```bash
 if [ -n "$PIPELINE_RESULT_PATH" ] && [ ! -s "$PIPELINE_RESULT_PATH" ]; then
@@ -128,3 +195,29 @@ if [ -n "$PIPELINE_RESULT_PATH" ] && [ ! -s "$PIPELINE_RESULT_PATH" ]; then
   echo "ship-agentic-ticket ERROR — exited without writing result"
 fi
 ```
+
+---
+
+## PROHIBITED COMMANDS
+
+This is the final pipeline step — the branch is already verified. Running build or test
+commands here re-introduces environment-dependent failures that quality-check already cleared,
+and risks exceeding the 90-second budget. If you find yourself about to run any of the
+following, stop and call the ERROR REPORTING PROCEDURE instead:
+
+- `./gradlew` (any task) — build tools are for verification, which is already done
+- `mvn`, `npm test`, `pytest`, or any other build/test tool
+- `gh pr checks` — waits on CI, violates the time budget
+- `git checkout`, `git branch`, `git rebase`, `git merge`, `git reset` — any of these can corrupt the worktree state in ways the pipeline cannot recover without a full reset
+
+---
+
+## ERROR HANDLING
+
+| Scenario | Action |
+|---|---|
+| Push fails | Call ERROR REPORTING PROCEDURE, EXIT |
+| Issue not found | Call ERROR REPORTING PROCEDURE, EXIT |
+| PR creation fails | Call ERROR REPORTING PROCEDURE, EXIT |
+| PR description skill missing or fails | Use fallback template, continue |
+| Done comment post fails | Log and EXIT — poller staleness watchdog will flag it |

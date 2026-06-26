@@ -18,10 +18,11 @@ import httpx
 
 # ── Config ───────────────────────────────────────────────────────────────────
 
-PIPELINE_ROOT = Path.home() / "Documents" / "Grindr" / "AgecticPipeline"
+PIPELINE_ROOT = Path(__file__).resolve().parent
 PYTHON_BIN    = PIPELINE_ROOT / ".venv" / "bin" / "python"
 POLLER_SCRIPT = PIPELINE_ROOT / "pipeline_poller.py"
 ENV_FILE      = PIPELINE_ROOT / ".env"
+PLIST_TEMPLATE = PIPELINE_ROOT / "install" / "dev.juan.pipeline-poller.plist"
 
 PIPELINE_DIR  = Path.home() / ".pipeline"
 LOG_DIR       = PIPELINE_DIR / "logs"
@@ -62,11 +63,65 @@ def _read_plist_env() -> dict[str, str]:
 
 # ── Daemon lifecycle (launchctl) ─────────────────────────────────────────────
 
+def _render_plist_template() -> str | None:
+    """Return the plist template rendered with real paths, or None if template missing."""
+    if not PLIST_TEMPLATE.exists():
+        return None
+    content = PLIST_TEMPLATE.read_text()
+    return (
+        content
+        .replace("{PYTHON_BIN}", str(PYTHON_BIN))
+        .replace("{POLLER_SCRIPT}", str(POLLER_SCRIPT))
+        .replace("{WORKING_DIR}", str(PIPELINE_ROOT))
+    )
+
+
+def cmd_install() -> None:
+    """Render the in-repo plist template and install it to ~/Library/LaunchAgents/."""
+    rendered = _render_plist_template()
+    if rendered is None:
+        print(f"error: plist template not found at {PLIST_TEMPLATE}")
+        print("Run this from the repo root or check that install/ exists.")
+        sys.exit(1)
+
+    PLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    if PLIST_PATH.exists() and PLIST_PATH.read_text() == rendered:
+        print(f"plist already up to date at {PLIST_PATH}")
+        return
+
+    PLIST_PATH.write_text(rendered)
+    print(f"installed plist → {PLIST_PATH}")
+    print(f"run 'agentic-dev-pipe restart' to apply changes")
+
+
 def cmd_start() -> None:
+    # Pre-check: reject if already running
+    sys.path.insert(0, str(PIPELINE_ROOT))
+    try:
+        import process_utils
+        launchd_pid = _get_launchctl_pid()
+        manual_pid  = process_utils.find_poller_pid()
+        running_pid = launchd_pid or manual_pid
+        if running_pid:
+            print(f"pipeline already running (pid {running_pid}) — start rejected")
+            print("  use: agentic-dev-pipe status   to inspect")
+            print("  use: agentic-dev-pipe restart  to restart")
+            sys.exit(1)
+    except ImportError:
+        pass
+
+    # Warn if installed plist is stale vs. repo template
+    rendered = _render_plist_template()
+    if rendered is not None and PLIST_PATH.exists():
+        if PLIST_PATH.read_text() != rendered:
+            print("warning: installed plist is out of date — run 'agentic-dev-pipe install' first")
+
     if not PLIST_PATH.exists():
         print(f"error: plist not found at {PLIST_PATH}")
-        print("Create it first — see pipeline setup docs.")
-        return
+        print("Run 'agentic-dev-pipe install' to set it up.")
+        sys.exit(1)
+
     result = subprocess.run(
         ["launchctl", "load", str(PLIST_PATH)],
         capture_output=True, text=True,
@@ -74,7 +129,11 @@ def cmd_start() -> None:
     if result.returncode == 0:
         print(f"loaded {PLIST_NAME}")
     else:
-        print(f"launchctl load failed: {result.stderr.strip() or result.stdout.strip()}")
+        err = result.stderr.strip() or result.stdout.strip()
+        if "already loaded" in err.lower():
+            print(f"pipeline already running — start rejected")
+        else:
+            print(f"launchctl load failed: {err}")
 
 
 def cmd_stop(force: bool = False) -> None:
@@ -453,6 +512,7 @@ def cmd_graph() -> None:
 
 
 COMMANDS = {
+    "install": cmd_install,
     "start":   cmd_start,
     "stop":    cmd_stop,
     "restart": cmd_restart,
@@ -466,7 +526,7 @@ COMMANDS = {
 
 
 def usage() -> None:
-    print("usage: agentic-dev-pipe {start|stop [--force]|restart|status|metrics|logs|poller|errors|graph}")
+    print("usage: agentic-dev-pipe {install|start|stop [--force]|restart|status|metrics|logs|poller|errors|graph}")
 
 
 def main() -> None:
