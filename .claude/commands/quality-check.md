@@ -1,6 +1,6 @@
 # quality-check
 
-Dispatches GitHub Actions workflows (detekt, lint, unit tests) against `Grindr/grindr-android` on the current branch and watches results. The workflows handle their own scope detection. The poller has already committed and pushed the implementation; this skill runs in the same worktree.
+Dispatches GitHub Actions workflows (detekt, lint, unit tests) against `grindrllc/grindr-android` on the current branch and watches results. The workflows handle their own scope detection. The poller has already committed and pushed the implementation; this skill runs in the same worktree.
 
 On success (all checks pass, with or without auto-fixes): post `<!-- ai-quality:done -->`.
 On unrecoverable code failure: post `<!-- ai-quality:error -->` — graph routes to `escalate_error`.
@@ -24,7 +24,7 @@ gh issue comment {ISSUE_NUMBER} \
   --body "⚠️ **Quality check failed — {CHECK_NAME}**
 
 **Error:** {ERROR_DESCRIPTION}
-**Run:** https://github.com/Grindr/grindr-android/actions/runs/{FAILED_RUN_ID}
+**Run:** https://github.com/grindrllc/grindr-android/actions/runs/{FAILED_RUN_ID}
 **Time:** $(date '+%Y-%m-%d %H:%M:%S')
 
 The ticket has been moved to **Error** for human review. Fix the issue and move it back to **AI Implementation** to retry.
@@ -117,10 +117,14 @@ If CHANGED_FILES is 0: run ERROR REPORTING PROCEDURE (with stage "verify-branch-
 ## PHASE 3 — Dispatch and watch workflows
 
 **Step 1 — Dispatch all three workflows:**
+
+All three workflows use a `branch` input (not `--ref`) to select the code branch to test.
+Dispatch from the default branch (master) and pass the implementation branch as input:
+
 ```bash
-gh workflow run detekt.yml       --ref "$BRANCH" --repo Grindr/grindr-android
-gh workflow run android-lint.yml --ref "$BRANCH" --repo Grindr/grindr-android
-gh workflow run unit-tests.yml   --ref "$BRANCH" --repo Grindr/grindr-android
+gh workflow run detekt.yml       --repo grindrllc/grindr-android -f branch="$BRANCH"
+gh workflow run android-lint.yml --repo grindrllc/grindr-android -f branch="$BRANCH"
+gh workflow run unit-tests.yml   --repo grindrllc/grindr-android -f branch="$BRANCH"
 ```
 
 If any dispatch fails with a network/quota error: run INFRASTRUCTURE FAILURE PROCEDURE and EXIT.
@@ -128,24 +132,27 @@ If any dispatch fails with a 401/403: run INFRASTRUCTURE FAILURE PROCEDURE (desc
 
 **Step 2 — Resolve run IDs:**
 
-Wait for GitHub to register the runs, then fetch each run ID. Retry up to 3 times with increasing delays (5s, 10s, 15s) if any ID comes back empty:
+Wait for GitHub to register the runs, then fetch each run ID. Because the workflows are
+dispatched from master (not `$BRANCH`), list by `--branch master` and take the most-recently-created
+run for each workflow. Retry up to 3 times with increasing delays (5s, 10s, 15s) if any ID
+comes back empty:
 
 ```bash
 sleep 5
-DETEKT_ID=$(gh run list --workflow detekt.yml       --branch "$BRANCH" --repo Grindr/grindr-android --limit 1 --json databaseId --jq '.[0].databaseId')
-LINT_ID=$(gh run list   --workflow android-lint.yml --branch "$BRANCH" --repo Grindr/grindr-android --limit 1 --json databaseId --jq '.[0].databaseId')
-TESTS_ID=$(gh run list  --workflow unit-tests.yml   --branch "$BRANCH" --repo Grindr/grindr-android --limit 1 --json databaseId --jq '.[0].databaseId')
+DETEKT_ID=$(gh run list --workflow detekt.yml       --branch master --repo grindrllc/grindr-android --limit 1 --json databaseId --jq '.[0].databaseId')
+LINT_ID=$(gh run list   --workflow android-lint.yml --branch master --repo grindrllc/grindr-android --limit 1 --json databaseId --jq '.[0].databaseId')
+TESTS_ID=$(gh run list  --workflow unit-tests.yml   --branch master --repo grindrllc/grindr-android --limit 1 --json databaseId --jq '.[0].databaseId')
 ```
 
 If any ID is still empty after 3 retries: run INFRASTRUCTURE FAILURE PROCEDURE and EXIT.
 
 **Step 3 — Watch all three in parallel:**
 ```bash
-gh run watch "$DETEKT_ID" --exit-status --repo Grindr/grindr-android &
+gh run watch "$DETEKT_ID" --exit-status --repo grindrllc/grindr-android &
 PID_DETEKT=$!
-gh run watch "$LINT_ID"   --exit-status --repo Grindr/grindr-android &
+gh run watch "$LINT_ID"   --exit-status --repo grindrllc/grindr-android &
 PID_LINT=$!
-gh run watch "$TESTS_ID"  --exit-status --repo Grindr/grindr-android &
+gh run watch "$TESTS_ID"  --exit-status --repo grindrllc/grindr-android &
 PID_TESTS=$!
 
 wait $PID_DETEKT; RC_DETEKT=$?
@@ -160,7 +167,7 @@ For each check with a non-zero exit code, attempt to fix and re-run it. Track at
 For each failing check:
 1. Download the failure log:
    ```bash
-   gh run view {FAILED_ID} --log-failed --repo Grindr/grindr-android
+   gh run view {FAILED_ID} --log-failed --repo grindrllc/grindr-android
    ```
 2. Read and understand the failure.
    - If it is a tool/environment issue (missing secret, runner quota exceeded, network timeout, missing dependency): run INFRASTRUCTURE FAILURE PROCEDURE and EXIT.
@@ -215,9 +222,9 @@ fi
 ```markdown
 ✅ **Quality checks passed**
 
-- detekt ✅ — https://github.com/Grindr/grindr-android/actions/runs/{DETEKT_ID}
-- lint ✅ — https://github.com/Grindr/grindr-android/actions/runs/{LINT_ID}
-- unit tests ✅ — https://github.com/Grindr/grindr-android/actions/runs/{TESTS_ID}
+- detekt ✅ — https://github.com/grindrllc/grindr-android/actions/runs/{DETEKT_ID}
+- lint ✅ — https://github.com/grindrllc/grindr-android/actions/runs/{LINT_ID}
+- unit tests ✅ — https://github.com/grindrllc/grindr-android/actions/runs/{TESTS_ID}
 - **Auto-fixes applied:** yes/no
 
 <!-- ai-quality:done -->
