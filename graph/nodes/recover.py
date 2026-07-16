@@ -111,6 +111,10 @@ def _infer_target_from_results(ticket: int, is_spike: bool = False) -> str | Non
 
     Algorithm:
       - Walk main pipeline stages in order; return the first that is not "done".
+      - Special case: if `Self Review` has any error outcomes, resume at `implement`
+        instead of `self_review` — a self-review failure means the code on the
+        branch has real bugs that a plain retry can't fix. The impl skill will
+        pick up the failure feedback from GitHub comments and address it.
       - If all main stages are done, check post-ship stages for failures.
       - If ship is done and no post-ship failures, return "monitor_pr" so the
         graph re-enters the CI-polling gate rather than replaying the whole pipeline.
@@ -130,6 +134,12 @@ def _infer_target_from_results(ticket: int, is_spike: bool = False) -> str | Non
     for stage_name, node_name in stages:
         outcome = _best_result_outcome(ticket_dir, stage_name)
         if outcome != "done":
+            # Self-review failure means the branch has real code bugs — go back
+            # to implement so the impl skill can address the self-review feedback,
+            # rather than replaying the same self_review against the same broken code.
+            if node_name == "self_review":
+                _log(f"  #{ticket}: recover — self_review has error outcomes; routing to 'implement' to address feedback")
+                return "implement"
             return node_name
 
     # All main stages done — look for a post-ship failure.
