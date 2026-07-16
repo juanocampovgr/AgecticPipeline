@@ -261,13 +261,33 @@ async def node_recover(state: TicketState, store=None) -> Command[_RECOVER_TARGE
 
     events.emit(ticket, "Recovery", "stage_completed", {"resumed_at": target})
 
+    # Reset retry counters for the target stage so operator-triggered recovery
+    # gets a fresh budget rather than immediately escalating on the first retry.
+    # Without this, a ticket that hit max_self_review_retries and was manually
+    # sent back to 'Ready To Pick Up' would escalate on attempt 3 → max=2.
+    retry_reset: dict = {}
+    if target in {"implement", "self_review"}:
+        retry_reset["impl"] = {"self_review_retry_count": 0}
+    if target == "fix_ci":
+        retry_reset["ship"] = {"ci_fix_count": 0}
+    if target == "respond":
+        retry_reset["impl"] = {"review_response_round": 0}
+
+    # Merge impl-dicts if both worktree_update and retry_reset touch it.
+    merged_update: dict = {**worktree_update}
+    for key, value in retry_reset.items():
+        if key in merged_update and isinstance(merged_update[key], dict) and isinstance(value, dict):
+            merged_update[key] = {**merged_update[key], **value}
+        else:
+            merged_update[key] = value
+
     return Command(
         goto=target,
         update={
             "identity": {"is_recovery": False, "recovery_target": ""},
             "errors":   [f"--- recovery: resumed at '{target}' ---"],
             "control":  {"current_stage": target},
-            **worktree_update,
+            **merged_update,
         },
     )
 
