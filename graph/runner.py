@@ -361,6 +361,7 @@ async def _launch_headless(
         cmd += ["--model", model]
 
     logf = open(log_path, "wb")  # noqa: WPS515 — kept open by background task
+    logf.write(f"=== cmd={' '.join(cmd)} ===\n".encode())
     logf.write(
         f"=== run_id={run_id} ticket={ticket} stage='{stage}' "
         f"model={model or '(cli-default)'} "
