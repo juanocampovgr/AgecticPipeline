@@ -264,8 +264,14 @@ async def node_recover(state: TicketState, store=None) -> Command[_RECOVER_TARGE
     # which turns operator recovery into a silent no-op.  Delete result files at
     # attempt indices ≥ the reset value for stages whose counters we reset.
     if target in {"implement", "self_review"}:
+        # Re-implementation also invalidates quality-check results — the checks
+        # were run against the previous (rejected) code, so their pass/fail is
+        # meaningless for the new implementation.
         _delete_result_files_for_stage(ticket, "AI Implementation")
+        _delete_result_files_for_stage(ticket, "AI Quality Check")
         _delete_result_files_for_stage(ticket, "Self Review")
+    elif target == "quality":
+        _delete_result_files_for_stage(ticket, "AI Quality Check")
     elif target == "fix_ci":
         _delete_result_files_for_stage(ticket, "Fix CI")
     elif target == "respond":
