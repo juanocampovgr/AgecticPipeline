@@ -7,7 +7,7 @@ from typing import Literal
 import httpx
 from langgraph.types import Command
 
-from graph.nodes._base import _log, move_status, resolve_worktree, get_retry_caps
+from graph.nodes._base import _log, move_status, resolve_worktree, get_retry_caps, stage_model
 from graph.runner import run_stage
 from graph.state import TicketState
 
@@ -47,6 +47,7 @@ async def node_respond(
         "tools":         "Bash,Read,Grep,Glob,Edit,Write,Agent",
         "extra_args":    "",
         "worktree_path": worktree_path,
+        "model":         stage_model("respond"),
     }
     res = await run_stage(state, "Respond To Review", context)
 

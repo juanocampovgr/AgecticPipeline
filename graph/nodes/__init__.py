@@ -12,7 +12,6 @@ from graph.nodes.ship import node_ship
 from graph.nodes.monitor_pr import node_monitor_pr
 from graph.nodes.fix_ci import node_fix_ci
 from graph.nodes.respond import node_respond
-from graph.nodes.followups import node_followups
 from graph.nodes.terminals import node_done, node_needs_human, node_escalate_error
 
 __all__ = [
@@ -28,7 +27,6 @@ __all__ = [
     "node_monitor_pr",
     "node_fix_ci",
     "node_respond",
-    "node_followups",
     "node_done",
     "node_needs_human",
     "node_escalate_error",

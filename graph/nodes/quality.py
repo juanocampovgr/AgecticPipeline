@@ -6,7 +6,7 @@ from typing import Literal
 
 from langgraph.types import Command
 
-from graph.nodes._base import _log
+from graph.nodes._base import _log, stage_model
 from graph.runner import run_stage
 from graph.state import TicketState
 
@@ -39,6 +39,7 @@ async def node_quality(
         "tools":         "Bash,Read,Grep,Glob,Edit,Write,Agent",
         "extra_args":    mode_arg,
         "worktree_path": worktree_path,
+        "model":         stage_model("quality"),
     }
     res = await run_stage(state, "AI Quality Check", context)
 

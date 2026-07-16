@@ -17,11 +17,12 @@ async def node_route_entry(state: TicketState) -> Command[Literal["plan", "imple
     entry     = identity.get("entry_point", "plan")
     ticket    = identity.get("ticket_number", 0)
 
-    target_status = "AI Implementation" if (is_spike or entry == "implement") else "AI Planning"
+    # Spikes are a planning/research activity — route them through the plan stage.
+    target_status = "AI Implementation" if entry == "implement" else "AI Planning"
     _log(f"  #{ticket}: route_entry → spike={is_spike} entry={entry} status='{target_status}'")
 
     async with httpx.AsyncClient(timeout=30) as client:
         await move_status(client, identity["item_id"], target_status)
 
-    goto = "implement" if (is_spike or entry == "implement") else "plan"
+    goto = "implement" if entry == "implement" else "plan"
     return Command(goto=goto)

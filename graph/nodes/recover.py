@@ -44,7 +44,6 @@ _STAGE_TO_NODE: dict[str, str] = {
     "Ready To Ship - AI": "ship",
     "Fix CI":             "fix_ci",
     "Respond To Review":  "respond",
-    "Spike Followups":    "followups",
 }
 
 # Reverse mapping — node name → stage name (for result-file lookup).
@@ -60,7 +59,6 @@ _NODE_TO_BOARD_STATUS: dict[str, str] = {
     "monitor_pr":  "In PR",
     "fix_ci":      "AI-PR Assistance",
     "respond":     "AI-PR Assistance",
-    "followups":   "Ready To Ship - AI",
 }
 
 # Ordered pipeline stages for disk-based target inference.
@@ -78,13 +76,12 @@ _PIPELINE_ORDER: list[tuple[str, str]] = [
 _POST_SHIP_STAGES: list[tuple[str, str]] = [
     ("Fix CI",            "fix_ci"),
     ("Respond To Review", "respond"),
-    ("Spike Followups",   "followups"),
 ]
 
 _RECOVER_TARGETS = Literal[
     "route_entry",
     "plan", "implement", "quality", "self_review",
-    "ship", "monitor_pr", "fix_ci", "respond", "followups",
+    "ship", "monitor_pr", "fix_ci", "respond",
 ]
 
 
@@ -188,10 +185,12 @@ async def node_recover(state: TicketState, store=None) -> Command[_RECOVER_TARGE
     if not identity.get("is_recovery"):
         return Command(goto="route_entry")
 
-    # Resolve target: explicit → disk inference → history scan → fall through.
+    # Resolve target: explicit → disk inference → AI → history scan → fall through.
+    repo_full = (identity.get("repo_full") or "").strip()
     target = (
         identity.get("recovery_target")
         or _infer_target_from_results(ticket, is_spike)
+        or (await _infer_target_via_ai(ticket, repo_full, is_spike, state) if repo_full else None)
         or _scan_history_for_target(state)
     )
 
@@ -281,3 +280,116 @@ def _scan_history_for_target(state: TicketState) -> str | None:
         if outcome and outcome != "done":
             return _STAGE_TO_NODE.get(entry.get("stage", ""))
     return None
+
+
+async def _infer_target_via_ai(ticket: int, repo_full: str, is_spike: bool, state: TicketState) -> str | None:
+    """Use Claude to infer the recovery target from issue comment markers and disk state.
+
+    Called only when disk inference and history scan both return None — i.e. the result
+    files and run_history don't have enough signal (e.g. a DB reset wiped run_history and
+    all the disk result files show 'done' through an intermediate stage, but a later stage
+    completed only as a GitHub comment marker with no result file on disk).
+
+    Returns a valid node name from _NODE_TO_BOARD_STATUS, or None on any failure.
+    """
+    import asyncio as _asyncio
+    import subprocess as _subprocess
+
+    # ── Gather evidence: issue comment markers ────────────────────────────────
+    markers: list[dict] = []
+    try:
+        result = _subprocess.run(
+            ["gh", "issue", "view", str(ticket), "--repo", repo_full,
+             "--json", "comments"],
+            capture_output=True, text=True, timeout=15,
+        )
+        if result.returncode == 0:
+            for comment in json.loads(result.stdout).get("comments", []):
+                body = comment.get("body", "")
+                created_at = comment.get("createdAt", "")
+                for line in body.splitlines():
+                    line = line.strip()
+                    if line.startswith("<!-- ai-") and line.endswith("-->"):
+                        markers.append({"marker": line, "timestamp": created_at})
+    except Exception as exc:
+        _log(f"  #{ticket}: recover — AI inference: comment fetch failed: {exc}")
+
+    # ── Gather evidence: disk result files ────────────────────────────────────
+    disk_state: list[dict] = []
+    try:
+        from graph.runner import RESULTS_DIR  # noqa: PLC0415
+        ticket_dir = RESULTS_DIR / str(ticket)
+        all_stages = _PIPELINE_ORDER + _POST_SHIP_STAGES
+        for stage_name, node_name in all_stages:
+            outcome = _best_result_outcome(ticket_dir, stage_name)
+            disk_state.append({"stage": stage_name, "node": node_name, "outcome": outcome})
+    except Exception as exc:
+        _log(f"  #{ticket}: recover — AI inference: disk state read failed: {exc}")
+
+    # ── Build prompt ──────────────────────────────────────────────────────────
+    pipeline_sequence = " → ".join(n for _, n in _PIPELINE_ORDER)
+    valid_targets = list(_NODE_TO_BOARD_STATUS.keys())
+
+    prompt = f"""You are determining the recovery point for a stalled CI pipeline ticket.
+
+PIPELINE STAGE ORDER (in sequence):
+{pipeline_sequence}
+Post-ship stages (can repeat): fix_ci, respond
+
+VALID RETURN VALUES (node names only): {valid_targets}
+
+EVIDENCE — Issue comment markers (chronological, oldest first):
+{json.dumps(markers, indent=2)}
+
+EVIDENCE — Result files on disk (outcome=null means no file exists):
+{json.dumps(disk_state, indent=2)}
+
+RULES:
+- A stage is "successfully completed" when its most recent marker ends with ":done".
+- A stage should re-run if its most recent marker ends with ":error" or ":needs-human".
+- If a later stage failed after an earlier one succeeded, resume at the failed stage.
+- If implementation was retried AFTER quality/self-review passed, quality must re-run.
+- Return "plan" only if planning never completed successfully.
+- When uncertain, prefer resuming at an earlier stage over skipping ahead.
+
+Respond with ONLY valid JSON — no markdown, no explanation outside the JSON:
+{{"target": "<node_name>", "confidence": "high|medium|low", "reason": "<one concise sentence>"}}"""
+
+    # ── Invoke claude -p ──────────────────────────────────────────────────────
+    try:
+        from graph.runner import _claude_bin  # noqa: PLC0415
+        claude = _claude_bin()
+        proc = await _asyncio.create_subprocess_exec(
+            claude, "-p", prompt, "--output-format", "json",
+            stdout=_asyncio.subprocess.PIPE,
+            stderr=_asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, _ = await _asyncio.wait_for(proc.communicate(), timeout=45)
+        except _asyncio.TimeoutError:
+            proc.kill()
+            await proc.communicate()
+            _log(f"  #{ticket}: recover — AI inference timed out")
+            return None
+
+        raw = stdout.decode("utf-8", errors="replace").strip()
+
+        # claude --output-format json wraps output: {"result": "<text>", ...}
+        outer = json.loads(raw)
+        inner_text = outer.get("result", raw)
+        parsed = json.loads(inner_text) if isinstance(inner_text, str) else inner_text
+
+        target     = (parsed.get("target") or "").strip()
+        reason     = parsed.get("reason", "")
+        confidence = parsed.get("confidence", "?")
+
+        if target in _NODE_TO_BOARD_STATUS:
+            _log(f"  #{ticket}: recover — AI inference [{confidence}]: target='{target}' — {reason}")
+            return target
+
+        _log(f"  #{ticket}: recover — AI inference returned unknown target '{target}' — skipping")
+        return None
+
+    except Exception as exc:
+        _log(f"  #{ticket}: recover — AI inference failed: {exc}")
+        return None

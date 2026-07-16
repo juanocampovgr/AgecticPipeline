@@ -597,6 +597,15 @@ async def _handle_gate(
         # Check nested state for pr_number (new nested schema: ship.pr_number)
         ship = graph_state_values.get("ship") or {}
         pr_number = ship.get("pr_number", 0) or graph_state_values.get("pr_number", 0)
+        pr_repo = ship.get("pr_url", "")  # may contain full URL; extract repo below
+
+        # Extract repo from pr_url if stored in state
+        _pr_repo_full = repo_full  # default; overridden below if we find a better match
+        if pr_repo:
+            import re as _re2
+            _m = _re2.search(r"github\.com/([^/]+/[^/]+)/pull/", pr_repo)
+            if _m:
+                _pr_repo_full = _m.group(1)
 
         # Fallback: scan issue comments for ai-ship:done marker which embeds the PR URL.
         # The issue lives in the AgecticPipeline repo (repo_full), not the target codebase repo.
@@ -614,16 +623,18 @@ async def _handle_gate(
                     for comment in _json.loads(result.stdout).get("comments", []):
                         body = comment.get("body", "")
                         if "ai-ship:done" in body:
-                            match = _re.search(r"/pull/(\d+)", body)
-                            if match:
-                                pr_number = int(match.group(1))
-                                _log(f"    #{ticket}: recovered pr_number={pr_number} from ai-ship:done comment")
+                            # Extract full PR URL to get both repo and pr_number
+                            full_match = _re.search(r"github\.com/([^/]+/[^/]+)/pull/(\d+)", body)
+                            if full_match:
+                                _pr_repo_full = full_match.group(1)
+                                pr_number = int(full_match.group(2))
+                                _log(f"    #{ticket}: recovered pr_number={pr_number} (repo={_pr_repo_full}) from ai-ship:done comment")
                                 break
             except Exception as _e:
                 _log(f"    #{ticket}: pr_number comment fallback failed: {_e}")
 
         if pr_number:
-            ci = await fetch_ci_status(client, repo_full, pr_number)
+            ci = await fetch_ci_status(client, _pr_repo_full, pr_number)
             if ci["status"] == "done":
                 await resume({"outcome": "done"})
                 return True

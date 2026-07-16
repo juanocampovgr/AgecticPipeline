@@ -11,7 +11,7 @@ from graph.nodes import (
     gate_impl_approval,
     node_ship,
     node_monitor_pr,
-    node_fix_ci, node_respond, node_followups,
+    node_fix_ci, node_respond,
     node_done, node_needs_human, node_escalate_error,
 )
 
@@ -32,7 +32,6 @@ def build_workflow(checkpointer, store=None):
     builder.add_node("monitor_pr",         node_monitor_pr)
     builder.add_node("fix_ci",             node_fix_ci)
     builder.add_node("respond",            node_respond)
-    builder.add_node("followups",          node_followups)
     builder.add_node("done",               node_done)
     builder.add_node("needs_human",        node_needs_human)
     builder.add_node("escalate_error",     node_escalate_error)

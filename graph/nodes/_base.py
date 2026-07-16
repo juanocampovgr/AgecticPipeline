@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from typing import TYPE_CHECKING
 
@@ -22,6 +23,26 @@ if TYPE_CHECKING:
 MAX_SELF_REVIEW_RETRIES    = 2
 MAX_CI_FIX_ATTEMPTS        = 3
 MAX_REVIEW_RESPONSE_ROUNDS = 2
+
+
+# ── Per-stage model tiers ─────────────────────────────────────────────────────
+# Opus for deep reasoning (planning); Sonnet for code-editing stages. Any tier
+# can be overridden via env var PIPELINE_<NODE>_MODEL (e.g. PIPELINE_PLAN_MODEL).
+_STAGE_MODEL_DEFAULTS = {
+    "plan":        "opus",
+    "implement":   "sonnet",
+    "quality":     "sonnet",
+    "self_review": "sonnet",
+    "ship":        "sonnet",
+    "fix_ci":      "sonnet",
+    "respond":     "sonnet",
+}
+
+
+def stage_model(node: str) -> str:
+    """Resolve the model for a stage: env override → default → '' (CLI default)."""
+    env_key = f"PIPELINE_{node.upper()}_MODEL"
+    return os.environ.get(env_key, _STAGE_MODEL_DEFAULTS.get(node, "")).strip()
 
 
 def _log(msg: str) -> None:
@@ -60,7 +81,18 @@ def get_retry_caps(store, repo: str) -> dict:
 
 
 async def resolve_repo_local(state: TicketState, store) -> str:
-    """Resolve the local repo path from Store → env → label inference."""
+    """Resolve the local repo path from Store → env → label → plan → GitHub fallback.
+
+    Resolution order (first match wins):
+      1. repo_profiles Store (per-repo override)
+      2. REPO_PATH_MAP  (exact repo name → path)
+      3. identity.labels (android / ios / backend)
+      4. approved_plan "**Affected**:" line (plan always states the codebase)
+      5. Live GitHub issue labels (fetched fresh — handles tickets with no labels at pickup)
+    """
+    import re  # noqa: PLC0415
+    import subprocess as _sp  # noqa: PLC0415
+
     identity = state.get("identity") or {}
     repo = identity.get("repo", "")
 
@@ -76,6 +108,7 @@ async def resolve_repo_local(state: TicketState, store) -> str:
     if repo_local:
         return repo_local
 
+    # Tier 3 — labels stored in identity state
     labels_lower = [la.lower() for la in identity.get("labels", [])]
     if "android" in labels_lower:
         return ANDROID_REPO_PATH
@@ -83,6 +116,69 @@ async def resolve_repo_local(state: TicketState, store) -> str:
         return IOS_REPO_PATH
     if "backend" in labels_lower:
         return BACKEND_REPO_PATH
+
+    # Tier 4 — parse the approved plan "**Affected**:" line (always present after planning)
+    plan_content = (state.get("request") or {}).get("approved_plan", "") or ""
+    if plan_content:
+        m = re.search(r"\*\*Affected\*\*:?\s*(.+)", plan_content[:1000])
+        if m:
+            affected = m.group(1).lower()
+            if "android" in affected:
+                return ANDROID_REPO_PATH
+            if "ios" in affected:
+                return IOS_REPO_PATH
+            if "backend" in affected:
+                return BACKEND_REPO_PATH
+
+    # Tier 5 — parse the most recent "## Implementation Plan" comment from GitHub.
+    # Handles the case where plan_content is empty because the result was auto-recovered
+    # (the auto-recover writes a minimal {"outcome":"done"} without plan_content, but the
+    # plan was still posted to GitHub by the skill).
+    repo_full  = identity.get("repo_full", "")
+    ticket_num = identity.get("ticket_number", 0)
+    if repo_full and ticket_num:
+        try:
+            result = _sp.run(
+                ["gh", "issue", "view", str(ticket_num), "--repo", repo_full,
+                 "--json", "comments",
+                 "--jq", '[.comments[] | select(.body | contains("## Implementation Plan")) | .body] | last'],
+                capture_output=True, text=True, timeout=15,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                comment_body = result.stdout.strip()
+                m = re.search(r"\*\*Affected\*\*:?\s*(.+)", comment_body[:1000])
+                if m:
+                    affected = m.group(1).lower()
+                    if "android" in affected:
+                        return ANDROID_REPO_PATH
+                    if "ios" in affected:
+                        return IOS_REPO_PATH
+                    if "backend" in affected:
+                        return BACKEND_REPO_PATH
+        except Exception:
+            pass
+
+    # Tier 6 — fetch current labels fresh from GitHub (covers tickets where labels were
+    # absent or not yet applied when the pipeline first picked up the ticket)
+    if repo_full and ticket_num:
+        try:
+            result = _sp.run(
+                ["gh", "issue", "view", str(ticket_num), "--repo", repo_full,
+                 "--json", "labels", "--jq", "[.labels[].name]"],
+                capture_output=True, text=True, timeout=15,
+            )
+            if result.returncode == 0:
+                import json as _json  # noqa: PLC0415
+                fresh_labels = [l.lower() for l in _json.loads(result.stdout.strip())]
+                if "android" in fresh_labels:
+                    return ANDROID_REPO_PATH
+                if "ios" in fresh_labels:
+                    return IOS_REPO_PATH
+                if "backend" in fresh_labels:
+                    return BACKEND_REPO_PATH
+        except Exception:
+            pass
+
     return ""
 
 

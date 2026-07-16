@@ -7,7 +7,7 @@ from typing import Literal
 import httpx
 from langgraph.types import Command
 
-from graph.nodes._base import _log, move_status, get_retry_caps
+from graph.nodes._base import _log, move_status, get_retry_caps, stage_model
 from graph.runner import run_stage
 from graph.state import TicketState
 
@@ -31,6 +31,7 @@ async def node_self_review(
         "command":    "/self-review-ticket",
         "tools":      "Bash,Read,Grep,Glob,Edit,Write,Agent",
         "extra_args": "",
+        "model":      stage_model("self_review"),
     }
     res = await run_stage(state, "Self Review", context)
 

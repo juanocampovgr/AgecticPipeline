@@ -7,7 +7,7 @@ from typing import Literal
 import httpx
 from langgraph.types import Command
 
-from graph.nodes._base import _log, move_status, resolve_worktree
+from graph.nodes._base import _log, move_status, resolve_worktree, stage_model
 from graph.runner import run_stage
 from graph.state import TicketState
 
@@ -35,6 +35,7 @@ async def node_ship(
         "tools":         "Bash,Read,Grep,Glob,Edit,Write,Agent",
         "extra_args":    "",
         "worktree_path": worktree_path,
+        "model":         stage_model("ship"),
     }
     res = await run_stage(state, "Ready To Ship - AI", context)
 
