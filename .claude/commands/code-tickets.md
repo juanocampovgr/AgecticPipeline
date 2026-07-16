@@ -65,11 +65,15 @@ Before exploring any code, check whether the target remote branch already contai
 a previous pipeline implementation. If it does, reuse it instead of re-implementing
 from scratch — this prevents divergent-history push failures on pipeline restarts.
 
-A branch is only reused when BOTH conditions hold:
+A branch is only reused when ALL these conditions hold:
 - It is **1–3 commits** ahead of master (1 impl commit ± 1–2 auto-fix commits).
 - It touches **≤ 50 files** (a larger footprint indicates contamination from a rebase replay or accumulated multi-retry runs).
+- **No self-review-failure marker is newer than the impl-done marker** — if
+  `<!-- ai-self-review:failed -->` was posted AFTER the last `<!-- ai-impl:done -->`,
+  the current branch is known-bad; a fresh implementation is required to address
+  the review feedback rather than re-run the same code through self-review again.
 
-If either bound is exceeded, fall through to a fresh implementation so the poller's
+If any bound fails, fall through to a fresh implementation so the poller's
 `setup_worktree` (which already deleted the over-large remote branch) can provide a clean base.
 
 ```bash
@@ -83,7 +87,21 @@ if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
   AHEAD=$(git rev-list --count "origin/master..origin/$BRANCH" 2>/dev/null || echo 0)
   FILES_TOUCHED=$(git diff --name-only "origin/master...origin/$BRANCH" 2>/dev/null | wc -l | tr -d ' ')
 
-  if [ "$AHEAD" -ge 1 ] && [ "$AHEAD" -le 3 ] && [ "$FILES_TOUCHED" -le 50 ]; then
+  # Check for a self-review failure that supersedes the last impl-done marker.
+  # If the newest ai-self-review:failed marker is newer than the newest ai-impl:done,
+  # the current branch has known blocking issues — do NOT reuse it.
+  SELF_REVIEW_BLOCKS_REUSE="no"
+  COMMENTS_JSON=$(gh issue view {ISSUE_NUMBER} --repo {ISSUE_REPO_FULL} --json comments 2>/dev/null)
+  if [ -n "$COMMENTS_JSON" ]; then
+    LATEST_IMPL_DONE=$(echo "$COMMENTS_JSON" | jq -r '[.comments[] | select(.body | contains("<!-- ai-impl:done -->"))] | last | .createdAt // ""')
+    LATEST_SELF_FAIL=$(echo "$COMMENTS_JSON" | jq -r '[.comments[] | select(.body | contains("<!-- ai-self-review:failed -->"))] | last | .createdAt // ""')
+    if [ -n "$LATEST_SELF_FAIL" ] && [ "$LATEST_SELF_FAIL" \> "$LATEST_IMPL_DONE" ]; then
+      SELF_REVIEW_BLOCKS_REUSE="yes"
+      echo "Latest self-review failure ($LATEST_SELF_FAIL) is newer than last impl-done ($LATEST_IMPL_DONE) — implementing fresh to address feedback."
+    fi
+  fi
+
+  if [ "$AHEAD" -ge 1 ] && [ "$AHEAD" -le 3 ] && [ "$FILES_TOUCHED" -le 50 ] && [ "$SELF_REVIEW_BLOCKS_REUSE" = "no" ]; then
     echo "Remote branch '$BRANCH' is $AHEAD commit(s) ahead of master ($FILES_TOUCHED files) — reusing it."
 
     # Bring the worktree in sync with the remote branch tip
@@ -158,6 +176,17 @@ plan_pr1 = {
 
 If no Implementation Plan comment found: call ERROR REPORTING PROCEDURE (stage: "extract plan") and EXIT.
 
+### Self-review feedback (only when re-implementing)
+
+Also scan `ticket.comments` for the most recent comment marked with
+`<!-- ai-self-review:failed -->`. If found AND its `createdAt` is newer than the
+most recent `<!-- ai-impl:done -->` marker, extract the failure text and store as
+`self_review_feedback`. This feedback names specific bugs found in the previous
+implementation attempt — the coding subagent MUST address every issue listed
+before completing the new implementation.
+
+If no such marker or it predates the last impl-done, `self_review_feedback` is empty.
+
 ---
 
 ## PHASE 3 — Implement (model: sonnet)
@@ -194,6 +223,14 @@ Title: {PR1_TITLE}
 
 ### Tests to add/update
 {TESTS_FROM_PLAN}
+
+### Self-review feedback from previous attempt (if any)
+{SELF_REVIEW_FEEDBACK}
+
+If the above feedback section is non-empty, this is a re-implementation attempt.
+The previous code on this branch was rejected during self-review for the specific
+issues listed. Address EVERY issue before completing — a re-implementation that
+does not resolve the listed bugs will fail self-review again.
 
 ## Implementation rules
 1. Read each file before editing to understand current state

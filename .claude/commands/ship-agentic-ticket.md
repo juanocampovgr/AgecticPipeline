@@ -108,20 +108,14 @@ Verified by AgecticPipeline quality-check (detekt, lint, unit tests passed).
 
 ---
 
-## PHASE 4 — Reserve result slot
+## PHASE 4 — (removed)
 
-Write a placeholder result *before* creating the PR. If the PR creation partially succeeds
-(e.g. the API call times out but GitHub still created the PR), this ensures the pipeline
-graph node sees `outcome: done` rather than a missing file and does not declare a crash:
+**DO NOT** write `outcome:done` to `$PIPELINE_RESULT_PATH` before creating the PR.
+Writing that outcome causes the runner to advance the graph and clean up the
+worktree while this subprocess is still executing, which leaves `gh pr create`
+without a valid cwd and produces an "In PR" ticket with no actual PR.
 
-```bash
-if [ -n "$PIPELINE_RESULT_PATH" ]; then
-  mkdir -p "$(dirname "$PIPELINE_RESULT_PATH")"
-  printf '{"outcome":"done","pr_number":0,"pr_url":""}' > "$PIPELINE_RESULT_PATH"
-fi
-```
-
-Phase 6 overwrites this with the real PR number and URL once confirmed.
+The result file is only written in PHASE 6, once the PR number is known.
 
 ---
 

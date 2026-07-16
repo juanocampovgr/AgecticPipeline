@@ -146,6 +146,28 @@ def _infer_target_from_results(ticket: int, is_spike: bool = False) -> str | Non
     return None
 
 
+def _delete_result_files_for_stage(ticket: int, stage_name: str) -> None:
+    """Delete ALL result files for a stage across every attempt index.
+
+    Used when operator recovery resets a stage's retry counter — the runner
+    otherwise reads cached results at attempt indices below the reset point
+    and skips re-launching.
+    """
+    try:
+        from graph.runner import RESULTS_DIR  # noqa: PLC0415
+        ticket_dir = RESULTS_DIR / str(ticket)
+        if not ticket_dir.exists():
+            return
+        slug = stage_name.lower().replace(" ", "_")
+        for attempt in range(10):
+            path = ticket_dir / f"{slug}_{attempt}.json"
+            if path.exists():
+                path.unlink()
+                _log(f"  #{ticket}: recover — deleted stale result {path.name}")
+    except Exception as e:
+        _log(f"  #{ticket}: recover — delete_result_files failed for {stage_name}: {e}")
+
+
 def _cleanup_orphaned_result(ticket: int, stage_name: str) -> None:
     """Delete result files for a stage that have no valid 'outcome' key.
 
@@ -225,6 +247,19 @@ async def node_recover(state: TicketState, store=None) -> Command[_RECOVER_TARGE
     stage_name = _NODE_TO_STAGE.get(target, "")
     if stage_name:
         _cleanup_orphaned_result(ticket, stage_name)
+
+    # When resetting retry counters (below), the runner will re-attempt earlier
+    # attempt numbers that already have result files from prior failed cycles.
+    # Those cached results cause `#N: <stage> result already exists → skip launch`,
+    # which turns operator recovery into a silent no-op.  Delete result files at
+    # attempt indices ≥ the reset value for stages whose counters we reset.
+    if target in {"implement", "self_review"}:
+        _delete_result_files_for_stage(ticket, "AI Implementation")
+        _delete_result_files_for_stage(ticket, "Self Review")
+    elif target == "fix_ci":
+        _delete_result_files_for_stage(ticket, "Fix CI")
+    elif target == "respond":
+        _delete_result_files_for_stage(ticket, "Respond To Review")
 
     # For nodes that use a worktree, rebuild it from a clean state so a crashed
     # subprocess cannot poison the retry with stale/contaminated files.
