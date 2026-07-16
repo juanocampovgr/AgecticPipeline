@@ -46,7 +46,6 @@ STALE_THRESHOLD: dict[str, int] = {
     "Self Review":         int(os.environ.get("STALE_SELF_REVIEW_SECONDS", "1800")),
     "Fix CI":              int(os.environ.get("STALE_FIX_CI_SECONDS",   "3600")),
     "Respond To Review":   int(os.environ.get("STALE_RESPOND_SECONDS",  "3600")),
-    "Spike Followups":     int(os.environ.get("STALE_FOLLOWUPS_SECONDS","1800")),
 }
 _DEFAULT_TIMEOUT = 3600
 
@@ -118,15 +117,17 @@ def _scan_log_for_offscript(log_path: Path, stage: str) -> bytes | None:
 
 # Stage-specific log patterns that confirm successful completion.
 # Used to auto-recover when a skill exits rc=0 without writing its result file.
-_SUCCESS_LOG_PATTERNS: dict[str, bytes] = {
-    "AI Quality Check":    b"quality-check Complete",
-    "AI Implementation":   b"code-tickets Complete",
-    "Self Review":         b"Self-review passed",
-    "Ready To Ship - AI":  b"Ship complete",
-    "Fix CI":              b"fix-ci-failure Complete",
-    "Respond To Review":   b"respond-to-review Complete",
-    "Spike Followups":     b"spike-tickets Complete",
-    "AI Planning":         b"plan-github-tickets Complete",
+# Each stage maps to a tuple of accepted markers (a stage may run more than one
+# skill — e.g. AI Planning runs /plan-github-tickets for normal tickets and
+# /spike-tickets for spikes).
+_SUCCESS_LOG_PATTERNS: dict[str, tuple[bytes, ...]] = {
+    "AI Quality Check":    (b"quality-check Complete",),
+    "AI Implementation":   (b"code-tickets Complete", b"background commit task completed successfully", b"Implementation complete \xe2\x80\x94 branch pushed"),
+    "Self Review":         (b"Self-review passed",),
+    "Ready To Ship - AI":  (b"Ship complete",),
+    "Fix CI":              (b"fix-ci-failure Complete",),
+    "Respond To Review":   (b"respond-to-review Complete",),
+    "AI Planning":         (b"plan-github-tickets Complete", b"spike-tickets Complete"),
 }
 
 
@@ -140,12 +141,12 @@ def _try_recover_result_from_log(
 
     Returns True if recovery succeeded (result file now exists and is valid).
     """
-    pattern = _SUCCESS_LOG_PATTERNS.get(stage)
-    if not pattern:
+    patterns = _SUCCESS_LOG_PATTERNS.get(stage)
+    if not patterns:
         return False
     try:
         content = log_path.read_bytes()
-        if pattern not in content:
+        if not any(p in content for p in patterns):
             return False
         # Log shows successful completion — write a minimal done result.
         result_path.parent.mkdir(parents=True, exist_ok=True)
@@ -347,11 +348,15 @@ async def _launch_headless(
     env = os.environ.copy()
     env["PIPELINE_RESULT_PATH"] = str(result_path)
 
+    model = context.get("model", "").strip()
     cmd = [claude, "-p", full_cmd, "--allowedTools", allowed_tools]
+    if model:
+        cmd += ["--model", model]
 
     logf = open(log_path, "wb")  # noqa: WPS515 — kept open by background task
     logf.write(
         f"=== run_id={run_id} ticket={ticket} stage='{stage}' "
+        f"model={model or '(cli-default)'} "
         f"started={time.strftime('%Y-%m-%dT%H:%M:%S')} "
         f"cwd={worktree_path or os.getcwd()} "
         f"result_path={result_path} ===\n".encode()

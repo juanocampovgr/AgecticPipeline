@@ -7,8 +7,8 @@ thread that encodes the full development lifecycle:
   Non-spike: AI Planning → [plan-approved] → AI Implementation → Self Review
              → [impl-approved] → Ready To Ship - AI → In PR → monitor CI/comments → Done
 
-  Spike:     AI Implementation (/spike-tickets) → [impl-approved → Done |
-             followup-approved → create follow-up tickets → Done]
+  Spike:     AI Planning (/spike-tickets research) → [plan-approved → Done |
+             feedback via /reset-ticket → re-queue → re-spike]
 
 Human approval gates still work by polling GitHub labels every cycle.
 Graph state is checkpointed in SQLite (~/.pipeline/graph_checkpoints.db) so
@@ -57,7 +57,6 @@ _STAGE_TO_NODE: dict[str, str] = {
     "Ready To Ship - AI": "ship",
     "Fix CI":             "fix_ci",
     "Respond To Review":  "respond",
-    "Spike Followups":    "followups",
 }
 
 # ── Config ───────────────────────────────────────────────────────────────────
@@ -232,13 +231,6 @@ AI_STAGES = {
         "tools":        "Bash,Read,Grep,Glob,Edit,Write,Agent",
         "done_marker":  "<!-- ai-review-response:done -->",
         "error_marker": "<!-- ai-review-response:needs-human -->",
-        "spawn_mode":   "headless",
-    },
-    "Spike Follow-ups": {
-        "command":      "/spike-tickets",
-        "tools":        "Bash,Read,Grep,Glob,Agent",
-        "done_marker":  "<!-- ai-followups:done -->",
-        "error_marker": "<!-- ai-followups:error -->",
         "spawn_mode":   "headless",
     },
 }
@@ -585,13 +577,8 @@ async def _handle_gate(
             await _gql_remove_label(client, item["issue_node_id"], repo_full, "plan-approved")
             return True
 
-    # ── Gate 2: impl-approved / followup-approved label ───────────────────────
+    # ── Gate 2: impl-approved label ───────────────────────────────────────────
     elif interrupt_value == "waiting_impl_approval":
-        if "followup-approved" in labels:
-            _log(f"    #{ticket}: followup-approved label detected")
-            await resume({"label": "followup-approved"})
-            await _gql_remove_label(client, item["issue_node_id"], repo_full, "followup-approved")
-            return True
         if "impl-approved" in labels:
             _log(f"    #{ticket}: impl-approved label detected")
             await resume({"label": "impl-approved"})
@@ -610,6 +597,31 @@ async def _handle_gate(
         # Check nested state for pr_number (new nested schema: ship.pr_number)
         ship = graph_state_values.get("ship") or {}
         pr_number = ship.get("pr_number", 0) or graph_state_values.get("pr_number", 0)
+
+        # Fallback: scan issue comments for ai-ship:done marker which embeds the PR URL.
+        # The issue lives in the AgecticPipeline repo (repo_full), not the target codebase repo.
+        if not pr_number and repo_full:
+            try:
+                import re as _re
+                import subprocess as _sub
+                import json as _json
+                result = _sub.run(
+                    ["gh", "issue", "view", str(ticket), "--repo", repo_full,
+                     "--json", "comments"],
+                    capture_output=True, text=True, timeout=15,
+                )
+                if result.returncode == 0:
+                    for comment in _json.loads(result.stdout).get("comments", []):
+                        body = comment.get("body", "")
+                        if "ai-ship:done" in body:
+                            match = _re.search(r"/pull/(\d+)", body)
+                            if match:
+                                pr_number = int(match.group(1))
+                                _log(f"    #{ticket}: recovered pr_number={pr_number} from ai-ship:done comment")
+                                break
+            except Exception as _e:
+                _log(f"    #{ticket}: pr_number comment fallback failed: {_e}")
+
         if pr_number:
             ci = await fetch_ci_status(client, repo_full, pr_number)
             if ci["status"] == "done":
@@ -804,14 +816,33 @@ async def reconcile_once(workflow) -> None:
                         jira_ticket_id = make_branch_id(jira_ticket_id, item.get("title", ""))
                         _log(f"    #{ticket}: branch id '{jira_ticket_id}'")
 
-                    _log(f"    #{ticket}: 'Ready To Pick Up' → starting new graph thread")
                     initial = _build_initial_state(
                         item, ticket, jira_ticket_id,
                         initial_request=body,
                         initial_request_url=f"https://github.com/{item['repo_full']}/issues/{ticket}",
                     )
-                    _open_dashboard(item, status="AI Planning")
-                    graph_events.emit(ticket, None, "status_changed", {"status": "AI Planning"})
+
+                    # If result files exist for this ticket, prior work was done.
+                    # Enter node_recover so disk/AI inference picks the correct resume
+                    # point rather than restarting from plan.
+                    from graph.runner import RESULTS_DIR  # noqa: PLC0415
+                    results_dir = RESULTS_DIR / str(ticket)
+                    has_prior_results = results_dir.exists() and any(results_dir.iterdir())
+                    if has_prior_results:
+                        _log(f"    #{ticket}: 'Ready To Pick Up' + prior results found → recovery start")
+                        initial = {
+                            **initial,
+                            "identity": {
+                                **initial.get("identity", {}),
+                                "is_recovery": True,
+                            },
+                        }
+                        _open_dashboard(item, status=status)
+                        graph_events.emit(ticket, None, "status_changed", {"status": "recovering"})
+                    else:
+                        _log(f"    #{ticket}: 'Ready To Pick Up' → starting new graph thread")
+                        _open_dashboard(item, status="AI Planning")
+                        graph_events.emit(ticket, None, "status_changed", {"status": "AI Planning"})
                     asyncio.create_task(_run_thread(workflow, thread_id, initial))
 
                 elif status == "Ready to Review then Plan" and "plan-approved" in item.get("labels", []):
@@ -851,6 +882,37 @@ async def reconcile_once(workflow) -> None:
                         interrupt_value = task.interrupts[0].value
                         break
 
+            # ── "Ready To Pick Up" = universal restart — overrides any graph state ──
+            # Always delegate to node_recover so it can use all inference tiers
+            # (disk files, AI, run_history) rather than the checkpoint-only view here.
+            if status == "Ready To Pick Up":
+                if thread_id in _active_threads:
+                    _log(f"    #{ticket}: Ready To Pick Up but thread still running — wait")
+                    continue
+                _log(f"    #{ticket}: Ready To Pick Up with existing checkpoint — operator reset, delegating to node_recover")
+                prev_values = graph_snapshot.values or {}
+                await _clear_checkpoint(thread_id)
+                # Refresh labels and item_id from the current board fetch so a
+                # stale or empty checkpoint (e.g. labels were added after first
+                # pickup) doesn't block repo resolution during recovery.
+                prev_identity = prev_values.get("identity") or {}
+                fresh_labels  = item.get("labels", prev_identity.get("labels", []))
+                recovery_state = {
+                    **prev_values,
+                    "identity": {
+                        **prev_identity,
+                        "is_recovery":     True,
+                        "recovery_target": "",
+                        "labels":          fresh_labels,
+                        "item_id":         item.get("item_id", prev_identity.get("item_id", "")),
+                        "issue_node_id":   item.get("issue_node_id", prev_identity.get("issue_node_id", "")),
+                    },
+                }
+                _open_dashboard(item, status=status)
+                graph_events.emit(ticket, None, "status_changed", {"status": "recovering"})
+                asyncio.create_task(_run_thread(workflow, thread_id, recovery_state))
+                continue
+
             if interrupt_value is not None:
                 # ── Job 2: Drive interrupt gates ───────────────────────────
                 _log(f"    #{ticket}: at interrupt '{interrupt_value}'")
@@ -887,32 +949,6 @@ async def reconcile_once(workflow) -> None:
                 asyncio.create_task(_run_thread(workflow, thread_id, recovery_state))
             elif graph_snapshot.next:
                 _log(f"    #{ticket}: node running in this process — skip")
-            elif status == "Ready To Pick Up":
-                # ── Dead-END recovery ──────────────────────────────────────
-                # Graph reached END (escalate_error / needs_human / done) and the
-                # operator moved the ticket back to "Ready To Pick Up". Build a
-                # recovery state and start a fresh thread that enters at
-                # `node_recover` — which will route to the failed stage.
-                prev_values = graph_snapshot.values or {}
-                target, failed_run = _compute_recovery_target(prev_values)
-                if target is None:
-                    _log(f"    #{ticket}: graph at END + Ready To Pick Up but no failed stage found — fresh restart")
-                    await _clear_checkpoint(thread_id)
-                    continue  # next poll will hit the standard "Ready To Pick Up" path
-                _log(f"    #{ticket}: dead-END recovery → resume at '{target}'")
-                _clear_failed_result_file(ticket, (failed_run or {}).get("stage", ""), prev_values)
-                await _clear_checkpoint(thread_id)
-                recovery_state = {
-                    **prev_values,
-                    "identity": {
-                        **(prev_values.get("identity") or {}),
-                        "is_recovery":     True,
-                        "recovery_target": target,
-                    },
-                }
-                _open_dashboard(item, status=status)
-                graph_events.emit(ticket, None, "status_changed", {"status": f"recovering → {target}"})
-                asyncio.create_task(_run_thread(workflow, thread_id, recovery_state))
             else:
                 _log(f"    #{ticket}: graph done — skip")
 
